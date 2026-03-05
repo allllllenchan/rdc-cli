@@ -33,7 +33,7 @@ rdc close
 
 ```bash
 uv tool install rdc-cli               # or: pipx install rdc-cli
-python scripts/build_renderdoc.py     # one-time build (needs cmake + ninja)
+bash <(curl -fsSL https://raw.githubusercontent.com/BANANASJIM/rdc-cli/master/scripts/build-renderdoc.sh)
 rdc doctor                            # verify everything works
 ```
 
@@ -41,18 +41,13 @@ rdc doctor                            # verify everything works
 
 ```bash
 uv tool install rdc-cli               # or: pipx install rdc-cli
-python scripts/build_renderdoc.py     # needs cmake + Visual Studio Build Tools
-rdc doctor
+rdc doctor                            # prints renderdoc setup instructions
 ```
 
 **PyPI — macOS** (Split client only)
 
 ```bash
 uv tool install rdc-cli               # or: pipx install rdc-cli
-# Local replay on macOS is not supported right now.
-# Use Split mode and run replay on a Linux/Windows daemon:
-#   rdc open /tmp/frame.rdc --listen 0.0.0.0:54321   # on replay host
-#   rdc open --connect host:54321 --token TOKEN       # on macOS client
 rdc doctor
 ```
 
@@ -82,17 +77,13 @@ pixi run setup-renderdoc              # build renderdoc (pixi installs toolchain
 | macOS | ❌ (not supported yet) | ✅ (recommended) |
 | Windows | ✅ | ✅ |
 
-### RenderDoc bootstrap (all platforms)
+### RenderDoc bootstrap (Linux)
 
 ```bash
-# Always run from the repo root
-python scripts/build_renderdoc.py .local/renderdoc --build-dir .local/renderdoc-build
-
-# or, if you're already using pixi:
-pixi run setup-renderdoc
+bash <(curl -fsSL https://raw.githubusercontent.com/BANANASJIM/rdc-cli/master/scripts/build-renderdoc.sh)
 ```
 
-That single Python script is the canonical path; the pixi task wraps it for convenience (and installs cmake/ninja/autotools on macOS).
+If building from source, use the pixi wrapper instead: `pixi run setup-renderdoc`
 
 ## Quickstart
 
