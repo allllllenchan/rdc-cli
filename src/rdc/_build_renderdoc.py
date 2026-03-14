@@ -22,8 +22,10 @@ import hashlib
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -462,6 +464,274 @@ def _install_vulkan_layer(install_dir: Path, build_dir: Path) -> None:
         _log(f"Vulkan implicit layer registered in HKCU\\{key_path}")
     except OSError as exc:
         _log(f"WARNING: failed to register Vulkan layer in registry: {exc}")
+
+
+def _android_apk_dir(lib_dir: Path) -> Path:
+    """Resolve the Android APK destination relative to *lib_dir*."""
+    return (lib_dir / ".." / "share" / "renderdoc" / "plugins" / "android").resolve()
+
+
+def download_android_apks(version: str, lib_dir: Path) -> None:
+    """Download official RenderDoc tarball and extract Android APKs.
+
+    Args:
+        version: RenderDoc version string (with or without ``v`` prefix).
+        lib_dir: The renderdoc Python module directory.
+    """
+    version = version.lstrip("v")
+    url = f"https://renderdoc.org/stable/{version}/renderdoc_{version}.tar.gz"
+    dest = _android_apk_dir(lib_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        _log(f"downloading {url}")
+        urlretrieve(url, str(tmp))
+        count = 0
+        with tarfile.open(str(tmp), "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.name.endswith(".apk"):
+                    continue
+                # Path traversal guard
+                resolved = (dest / Path(member.name).name).resolve()
+                if not resolved.is_relative_to(dest):
+                    continue
+                # Use data_filter if available (Python 3.12+)
+                if hasattr(tarfile, "data_filter"):
+                    member.name = Path(member.name).name
+                    tf.extract(member, dest, filter="data")
+                else:
+                    src_io = tf.extractfile(member)
+                    if src_io is None:
+                        continue
+                    (dest / Path(member.name).name).write_bytes(src_io.read())
+                count += 1
+        if count == 0:
+            sys.stderr.write("ERROR: no APK files found in tarball\n")
+            raise SystemExit(1)
+        _log(f"extracted {count} APK(s) to {dest}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def patch_arm_studio_elf(arm_path: Path) -> Path:
+    """Patch ARM PS qrenderdoc to be loadable as renderdoc.so Python module.
+
+    ARM Performance Studio embeds PyInit_renderdoc in the qrenderdoc PIE
+    executable. Patching two ELF fields makes it dlopen-able as a shared
+    object:
+
+    1. PT_INTERP program header type -> PT_NULL (allows dlopen of PIE)
+    2. DF_1_PIE bit cleared from DT_FLAGS_1 (removes PIE marker)
+
+    Idempotent: skips if renderdoc.so already exists with same size as source.
+
+    Args:
+        arm_path: Root of ARM Performance Studio installation.
+
+    Returns:
+        Path to the patched renderdoc.so.
+    """
+    lib = arm_path / "renderdoc_for_arm_gpus" / "lib"
+    src = lib / "qrenderdoc"
+    dst = lib / "renderdoc.so"
+
+    if not src.exists():
+        sys.stderr.write(f"ERROR: qrenderdoc not found at {src}\n")
+        raise SystemExit(1)
+
+    if dst.exists() and dst.stat().st_size == src.stat().st_size:
+        _log(f"renderdoc.so already patched at {dst}")
+        return dst
+
+    data = bytearray(src.read_bytes())
+
+    # Validate ELF magic
+    if data[:4] != b"\x7fELF":
+        sys.stderr.write(f"ERROR: {src} is not an ELF file\n")
+        raise SystemExit(1)
+
+    ei_class = data[4]
+    if ei_class == 1:
+        phdr_fmt, dyn_fmt = "<IIIIIIII", "<iI"
+    elif ei_class == 2:
+        phdr_fmt, dyn_fmt = "<IIQQQQQQ", "<qQ"
+    else:
+        sys.stderr.write(f"ERROR: unknown ELF class {ei_class}\n")
+        raise SystemExit(1)
+
+    # ELF header layout is identical for both classes after e_ident;
+    # phoff/phentsize/phnum offsets differ by pointer size.
+    if ei_class == 2:
+        e_phoff = struct.unpack_from("<Q", data, 32)[0]
+        e_phentsize = struct.unpack_from("<H", data, 54)[0]
+        e_phnum = struct.unpack_from("<H", data, 56)[0]
+    else:
+        e_phoff = struct.unpack_from("<I", data, 28)[0]
+        e_phentsize = struct.unpack_from("<H", data, 42)[0]
+        e_phnum = struct.unpack_from("<H", data, 44)[0]
+
+    pt_interp, pt_null, pt_dynamic = 3, 0, 2
+    dt_flags_1 = 0x6FFFFFFB
+    df_1_pie = 0x08000000
+
+    patched_interp = False
+    dyn_offset = 0
+    dyn_size = 0
+
+    # Pass 1: patch PT_INTERP and find PT_DYNAMIC
+    for i in range(e_phnum):
+        off = e_phoff + i * e_phentsize
+        phdr = struct.unpack_from(phdr_fmt, data, off)
+        p_type = phdr[0]
+
+        if p_type == pt_interp:
+            struct.pack_into("<I", data, off, pt_null)
+            patched_interp = True
+            _log(f"patched PT_INTERP -> PT_NULL at phdr[{i}]")
+
+        if p_type == pt_dynamic:
+            if ei_class == 2:
+                # 64-bit: type, flags, offset, vaddr, paddr, filesz, memsz, align
+                dyn_offset = phdr[2]
+                dyn_size = phdr[5]
+            else:
+                # 32-bit: type, offset, vaddr, paddr, filesz, memsz, flags, align
+                dyn_offset = phdr[1]
+                dyn_size = phdr[4]
+
+    if not patched_interp:
+        _log("warning: no PT_INTERP found (already patched or not a PIE?)")
+
+    # Pass 2: patch DT_FLAGS_1 in .dynamic
+    patched_flags = False
+    if dyn_offset and dyn_size:
+        dyn_entry_size = struct.calcsize(dyn_fmt)
+        n_entries = dyn_size // dyn_entry_size
+        for j in range(n_entries):
+            entry_off = dyn_offset + j * dyn_entry_size
+            d_tag, d_val = struct.unpack_from(dyn_fmt, data, entry_off)
+            if d_tag == 0:  # DT_NULL — end of .dynamic
+                break
+            if d_tag == dt_flags_1:
+                new_val = d_val & ~df_1_pie
+                if ei_class == 2:
+                    struct.pack_into("<Q", data, entry_off + 8, new_val)
+                else:
+                    struct.pack_into("<I", data, entry_off + 4, new_val)
+                patched_flags = True
+                _log(f"patched DT_FLAGS_1: 0x{d_val:x} -> 0x{new_val:x}")
+                break
+
+    if not patched_flags:
+        _log("warning: DT_FLAGS_1 not found in .dynamic")
+
+    dst.write_bytes(bytes(data))
+    # Preserve executable permission
+    _ensure_executable(dst)
+    _log(f"patched renderdoc.so written to {dst}")
+    return dst
+
+
+def install_arm_studio(arm_path: Path, lib_dir: Path) -> None:
+    """Copy ARM Performance Studio Android APKs into the local install.
+
+    Only APKs are copied — the host-side renderdoc module stays upstream
+    (ARM PS bundles Python 3.10 which is ABI-incompatible). The ARM APKs
+    contain Mali-optimized remoteserver that runs on the device.
+
+    Args:
+        arm_path: Root of ARM Performance Studio installation.
+        lib_dir: The renderdoc Python module directory.
+    """
+    # ARM PS uses "renderdoc_for_arm_gpus" (not "renderdoc")
+    for subdir in ("renderdoc_for_arm_gpus", "renderdoc"):
+        arm_apk_dir = arm_path / subdir / "share" / "renderdoc" / "plugins" / "android"
+        if arm_apk_dir.is_dir():
+            break
+    else:
+        sys.stderr.write(f"ERROR: no renderdoc directory found in {arm_path}\n")
+        raise SystemExit(1)
+
+    apks = list(arm_apk_dir.glob("*.apk"))
+    if not apks:
+        sys.stderr.write(f"ERROR: no APKs found in {arm_apk_dir}\n")
+        raise SystemExit(1)
+
+    dest = _android_apk_dir(lib_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    for apk in apks:
+        shutil.copy2(apk, dest / apk.name)
+    _log(f"copied {len(apks)} ARM APK(s) to {dest}")
+
+    patch_arm_studio_elf(arm_path)
+
+
+_ARM_PS_URLS = {
+    "linux": "https://artifacts.tools.arm.com/arm-performance-studio/{v}/Arm_Performance_Studio_{v}_linux_x86-64.tgz",
+    "darwin": "https://artifacts.tools.arm.com/arm-performance-studio/{v}/Arm_Performance_Studio_{v}_macos_arm64.dmg",
+}
+_ARM_PS_VERSION = "2025.7"
+
+
+def download_arm_studio(dest: Path) -> Path:
+    """Download ARM Performance Studio and extract to *dest*.
+
+    Returns the root directory of the extracted ARM PS installation.
+    The actual renderdoc directory inside is ``renderdoc_for_arm_gpus/``.
+    Idempotent: skips if the APK marker exists.
+    Only supports Linux (.tgz). Windows is not supported.
+
+    Args:
+        dest: Target directory (e.g. ``.local/arm-performance-studio``).
+    """
+    marker = dest / "renderdoc_for_arm_gpus" / "share" / "renderdoc" / "plugins" / "android"
+    if marker.is_dir() and list(marker.glob("*.apk")):
+        _log(f"ARM Performance Studio already present at {dest}")
+        return dest
+
+    if sys.platform == "win32":
+        sys.stderr.write("ERROR: ARM Performance Studio download not supported on Windows\n")
+        raise SystemExit(1)
+
+    key = sys.platform if sys.platform in _ARM_PS_URLS else "linux"
+    url = _ARM_PS_URLS[key].format(v=_ARM_PS_VERSION)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        _log(f"downloading ARM Performance Studio from {url}")
+        urlretrieve(url, str(tmp))
+        _log("extracting...")
+        with tarfile.open(str(tmp), "r:gz") as tf:
+            # Strip top-level directory to extract directly into dest
+            for member in tf.getmembers():
+                # Path traversal guard
+                parts = Path(member.name).parts
+                if len(parts) <= 1:
+                    continue
+                rel = str(Path(*parts[1:]))
+                resolved = (dest / rel).resolve()
+                if not resolved.is_relative_to(dest.resolve()):
+                    continue
+                member.name = rel
+                if hasattr(tarfile, "data_filter"):
+                    tf.extract(member, dest, filter="data")
+                else:
+                    tf.extract(member, dest)
+        if not marker.is_dir() or not list(marker.glob("*.apk")):
+            sys.stderr.write(f"ERROR: no APKs found at {marker} after extraction\n")
+            raise SystemExit(1)
+        _log(f"ARM Performance Studio extracted to {dest}")
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
 
 
 def _artifacts_present(install_dir: Path, plat: str) -> bool:

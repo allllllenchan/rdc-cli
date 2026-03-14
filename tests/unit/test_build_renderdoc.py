@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import struct
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -788,3 +790,270 @@ def test_install_vulkan_layer_skips_when_no_json(tmp_path: Path) -> None:
 
     # Should not raise
     br._install_vulkan_layer(install_dir, build_dir)
+
+
+# ---------------------------------------------------------------------------
+# download_android_apks
+# ---------------------------------------------------------------------------
+
+
+def _make_apk_tar(apk_name: str = "org.renderdoc.renderdoccmd.arm64.apk") -> bytes:
+    """Create a minimal tar.gz with one APK inside the expected path."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"fake-apk-content"
+        info = tarfile.TarInfo(name=f"renderdoc_1.41/share/renderdoc/plugins/android/{apk_name}")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_download_android_apks_happy_path(tmp_path: Path) -> None:
+    content = _make_apk_tar()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    def fake_retrieve(url: str, dest: str) -> tuple[str, None]:
+        Path(dest).write_bytes(content)
+        return dest, None
+
+    with patch("rdc._build_renderdoc.urlretrieve", fake_retrieve):
+        br.download_android_apks("1.41", lib_dir)
+
+    apk_dir = br._android_apk_dir(lib_dir)
+    apks = list(apk_dir.glob("*.apk"))
+    assert len(apks) == 1
+    assert apks[0].name == "org.renderdoc.renderdoccmd.arm64.apk"
+
+
+def test_download_android_apks_url_format(tmp_path: Path) -> None:
+    content = _make_apk_tar()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    captured_url: list[str] = []
+
+    def fake_retrieve(url: str, dest: str) -> tuple[str, None]:
+        captured_url.append(url)
+        Path(dest).write_bytes(content)
+        return dest, None
+
+    with patch("rdc._build_renderdoc.urlretrieve", fake_retrieve):
+        br.download_android_apks("1.41", lib_dir)
+
+    assert "renderdoc.org/stable/1.41/" in captured_url[0]
+
+
+def test_download_android_apks_strips_v_prefix(tmp_path: Path) -> None:
+    content = _make_apk_tar()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+    captured_url: list[str] = []
+
+    def fake_retrieve(url: str, dest: str) -> tuple[str, None]:
+        captured_url.append(url)
+        Path(dest).write_bytes(content)
+        return dest, None
+
+    with patch("rdc._build_renderdoc.urlretrieve", fake_retrieve):
+        br.download_android_apks("v1.41", lib_dir)
+
+    assert "1.41" in captured_url[0]
+    assert "v1.41" not in captured_url[0]
+
+
+def test_download_android_apks_network_error(tmp_path: Path) -> None:
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    with (
+        patch("rdc._build_renderdoc.urlretrieve", side_effect=OSError("network")),
+        pytest.raises(OSError),
+    ):
+        br.download_android_apks("1.41", lib_dir)
+
+
+def test_download_android_apks_no_apks_in_tarball(tmp_path: Path) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        data = b"not-an-apk"
+        info = tarfile.TarInfo(name="renderdoc_1.41/README.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    content = buf.getvalue()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    def fake_retrieve(url: str, dest: str) -> tuple[str, None]:
+        Path(dest).write_bytes(content)
+        return dest, None
+
+    with (
+        patch("rdc._build_renderdoc.urlretrieve", fake_retrieve),
+        pytest.raises(SystemExit),
+    ):
+        br.download_android_apks("1.41", lib_dir)
+
+
+# ---------------------------------------------------------------------------
+# install_arm_studio
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_elf64() -> bytes:
+    """Build a minimal 64-bit ELF with PT_INTERP and DT_FLAGS_1 (DF_1_PIE)."""
+    # ELF header (64 bytes)
+    e_ident = b"\x7fELF" + b"\x02\x01\x01" + b"\x00" * 9  # 16 bytes
+    e_phoff = 64  # program headers start right after ehdr
+    e_phentsize = 56  # Elf64_Phdr size
+    e_phnum = 2  # PT_INTERP + PT_DYNAMIC
+    ehdr = e_ident + struct.pack(
+        "<HHIQQQIHHHHHH",
+        2,  # e_type = ET_EXEC
+        0x3E,  # e_machine = EM_X86_64
+        1,  # e_version
+        0,  # e_entry
+        e_phoff,  # e_phoff
+        0,  # e_shoff
+        0,  # e_flags
+        64,  # e_ehsize
+        e_phentsize,  # e_phentsize
+        e_phnum,  # e_phnum
+        0,  # e_shentsize
+        0,  # e_shnum
+        0,  # e_shstrndx
+    )
+
+    # Dynamic section at offset 256
+    dyn_off = 256
+    # DT_FLAGS_1 with DF_1_PIE set, then DT_NULL
+    dyn_data = struct.pack("<qQ", 0x6FFFFFFB, 0x08000000)  # DT_FLAGS_1
+    dyn_data += struct.pack("<qQ", 0, 0)  # DT_NULL
+
+    # PT_INTERP (type=3)
+    phdr_interp = struct.pack("<IIQQQQQQ", 3, 0, 200, 0, 0, 16, 16, 0)
+    # PT_DYNAMIC (type=2), pointing to dyn_off
+    phdr_dynamic = struct.pack(
+        "<IIQQQQQQ",
+        2,
+        0,
+        dyn_off,
+        0,
+        0,
+        len(dyn_data),
+        len(dyn_data),
+        0,
+    )
+
+    buf = bytearray(512)
+    buf[: len(ehdr)] = ehdr
+    buf[e_phoff : e_phoff + len(phdr_interp)] = phdr_interp
+    buf[e_phoff + e_phentsize : e_phoff + e_phentsize + len(phdr_dynamic)] = phdr_dynamic
+    buf[dyn_off : dyn_off + len(dyn_data)] = dyn_data
+    return bytes(buf)
+
+
+def _make_arm_dir(tmp_path: Path) -> Path:
+    """Create a fake ARM Performance Studio directory structure."""
+    arm = tmp_path / "arm-ps"
+    rdoc = arm / "renderdoc_for_arm_gpus"
+    apk_dir = rdoc / "share" / "renderdoc" / "plugins" / "android"
+    apk_dir.mkdir(parents=True)
+    (apk_dir / "org.renderdoc.renderdoccmd.arm64.apk").write_bytes(b"fake-apk")
+    lib_dir = rdoc / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "qrenderdoc").write_bytes(_make_fake_elf64())
+    return arm
+
+
+def test_install_arm_studio_happy_path(tmp_path: Path) -> None:
+    arm = _make_arm_dir(tmp_path)
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    br.install_arm_studio(arm, lib_dir)
+
+    apk_dir = br._android_apk_dir(lib_dir)
+    assert list(apk_dir.glob("*.apk"))
+    # Verify ELF was patched
+    patched = arm / "renderdoc_for_arm_gpus" / "lib" / "renderdoc.so"
+    assert patched.exists()
+
+
+def test_install_arm_studio_no_renderdoc_dir(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    arm.mkdir()
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    with pytest.raises(SystemExit):
+        br.install_arm_studio(arm, lib_dir)
+
+
+def test_install_arm_studio_missing_apks(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    rdoc = arm / "renderdoc_for_arm_gpus"
+    (rdoc / "share" / "renderdoc" / "plugins" / "android").mkdir(parents=True)
+    # No APK files
+    lib_dir = tmp_path / "lib"
+    lib_dir.mkdir()
+
+    with pytest.raises(SystemExit):
+        br.install_arm_studio(arm, lib_dir)
+
+
+# ---------------------------------------------------------------------------
+# patch_arm_studio_elf
+# ---------------------------------------------------------------------------
+
+
+def test_patch_arm_studio_elf_happy_path(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    lib = arm / "renderdoc_for_arm_gpus" / "lib"
+    lib.mkdir(parents=True)
+    elf_data = _make_fake_elf64()
+    (lib / "qrenderdoc").write_bytes(elf_data)
+
+    result = br.patch_arm_studio_elf(arm)
+
+    assert result == lib / "renderdoc.so"
+    assert result.exists()
+    patched = bytearray(result.read_bytes())
+    # PT_INTERP (offset 64, first phdr) should now be PT_NULL (0)
+    p_type = struct.unpack_from("<I", patched, 64)[0]
+    assert p_type == 0
+    # DT_FLAGS_1 value should have DF_1_PIE cleared
+    dyn_off = 256
+    _, d_val = struct.unpack_from("<qQ", patched, dyn_off)
+    assert d_val & 0x08000000 == 0
+
+
+def test_patch_arm_studio_elf_idempotent(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    lib = arm / "renderdoc_for_arm_gpus" / "lib"
+    lib.mkdir(parents=True)
+    elf_data = _make_fake_elf64()
+    (lib / "qrenderdoc").write_bytes(elf_data)
+    # Pre-create renderdoc.so with same size
+    (lib / "renderdoc.so").write_bytes(elf_data)
+
+    result = br.patch_arm_studio_elf(arm)
+    assert result == lib / "renderdoc.so"
+
+
+def test_patch_arm_studio_elf_missing_qrenderdoc(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    lib = arm / "renderdoc_for_arm_gpus" / "lib"
+    lib.mkdir(parents=True)
+
+    with pytest.raises(SystemExit):
+        br.patch_arm_studio_elf(arm)
+
+
+def test_patch_arm_studio_elf_not_elf(tmp_path: Path) -> None:
+    arm = tmp_path / "arm-ps"
+    lib = arm / "renderdoc_for_arm_gpus" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "qrenderdoc").write_bytes(b"not-an-elf-file")
+
+    with pytest.raises(SystemExit):
+        br.patch_arm_studio_elf(arm)

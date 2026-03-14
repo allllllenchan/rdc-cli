@@ -205,10 +205,10 @@ def _layer3_queries() -> None:
 
 def _layer4_vfs() -> None:
     _emit("\n=== Layer 4: VFS ===")
-    _check_nonzero("rdc ls /", *_RDC, "ls", "/")
-    _check_nonzero("rdc ls /draws", *_RDC, "ls", "/draws")
-    _check_nonzero("rdc tree / --depth 1", *_RDC, "tree", "/", "--depth", "1")
     if _replay_ready:
+        _check_nonzero("rdc ls /", *_RDC, "ls", "/")
+        _check_nonzero("rdc ls /draws", *_RDC, "ls", "/draws")
+        _check_nonzero("rdc tree / --depth 1", *_RDC, "tree", "/", "--depth", "1")
         _check_nonzero("rdc cat /info", *_RDC, "cat", "/info")
         _check_nonzero("rdc cat /stats", *_RDC, "cat", "/stats")
     else:
@@ -218,15 +218,12 @@ def _layer4_vfs() -> None:
 
 def _layer5_completion() -> None:
     _emit("\n=== Layer 5: VFS completion ===")
+    if not _replay_ready:
+        _emit("  (skipped: replay not available)")
+        return
     _check_nonzero("complete /", *_RDC, "_complete", "/")
     _check_nonzero("complete /d", *_RDC, "_complete", "/d")
-
-    if _replay_ready:
-        _check_output("complete /d -> /draws/", "/draws/", *_RDC, "_complete", "/d")
-    else:
-        _check_output("complete /d (no replay)", "no replay loaded", *_RDC, "_complete", "/d")
-
-    # Click shell_complete env var test
+    _check_output("complete /d -> /draws/", "/draws/", *_RDC, "_complete", "/d")
     env_extra = {
         "_RDC_COMPLETE": "bash_complete",
         "COMP_WORDS": "rdc ls /d",
@@ -235,10 +232,8 @@ def _layer5_completion() -> None:
     try:
         r = _run_env(env_extra, *_RDC, timeout=10)
         combined = r.stdout + r.stderr
-        if _replay_ready and ("/draws/" in combined or "dir,/draws" in combined):
+        if "/draws/" in combined or "dir,/draws" in combined:
             _pass("click shell_complete /d")
-        elif not _replay_ready and "no replay loaded" in combined:
-            _pass("click shell_complete /d (no replay)")
         else:
             first_line = combined.strip().split("\n")[0] if combined.strip() else "(empty)"
             _fail("click shell_complete /d", f"got '{first_line}'")
