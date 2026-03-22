@@ -167,26 +167,47 @@ def resource_cmd(resid: int, use_json: bool) -> None:
 @click.option(
     "--graph", is_flag=True, default=False, help="Human-readable graph (requires --deps)."
 )
+@click.option(
+    "--table",
+    is_flag=True,
+    default=False,
+    help="Per-pass I/O table (requires --deps).",
+)
+@click.option(
+    "--switches",
+    is_flag=True,
+    default=False,
+    help="Show RT switch count per pass (TBR flush risk).",
+)
 @list_output_options
-def passes_cmd(
+def passes_cmd(  # noqa: PLR0913
     use_json: bool,
     deps: bool,
     dot: bool,
     graph: bool,
+    table: bool,
+    switches: bool,
     no_header: bool,
     use_jsonl: bool,
     quiet: bool,
 ) -> None:
     """List render passes."""
-    if (dot or graph) and not deps:
-        raise click.UsageError("--dot/--graph requires --deps")
+    if (dot or graph or table) and not deps:
+        raise click.UsageError("--dot/--graph/--table requires --deps")
+    if table and dot:
+        raise click.UsageError("--table and --dot are mutually exclusive")
+    if table and graph:
+        raise click.UsageError("--table and --graph are mutually exclusive")
     if deps and (no_header or use_jsonl or quiet):
-        raise click.UsageError("--deps only supports --json, --dot, and --graph")
+        raise click.UsageError("--deps only supports --json, --dot, --graph, and --table")
     if deps:
-        _passes_deps(use_json, dot, graph)
+        _passes_deps(use_json, dot, graph, table)
         return
 
-    result = call("passes", {})
+    params: dict[str, Any] = {}
+    if switches:
+        params["switches"] = True
+    result = call("passes", params)
     tree: dict[str, Any] = result.get("tree", {})
     if use_json:
         write_json(tree)
@@ -199,11 +220,25 @@ def passes_cmd(
         for p in passes:
             sys.stdout.write(str(p.get("name", "")) + "\n")
     else:
-        tsv_rows = [[p.get("name", "-"), p.get("draws", 0)] for p in passes]
-        write_tsv(tsv_rows, header=["NAME", "DRAWS"], no_header=no_header)
+        header = ["NAME", "DRAWS", "DISPATCHES", "TRIANGLES", "BEGIN_EID", "END_EID"]
+        if switches:
+            header.append("RT_SWITCHES")
+        tsv_rows = [
+            [
+                p.get("name", "-"),
+                p.get("draws", 0),
+                p.get("dispatches", 0),
+                p.get("triangles", 0),
+                p.get("begin_eid", "-"),
+                p.get("end_eid", "-"),
+            ]
+            + ([p.get("rt_switches", {}).get("count", 0)] if switches else [])
+            for p in passes
+        ]
+        write_tsv(tsv_rows, header=header, no_header=no_header)
 
 
-def _passes_deps(use_json: bool, dot: bool, graph: bool) -> None:
+def _passes_deps(use_json: bool, dot: bool, graph: bool, table: bool) -> None:
     result = call("pass_deps", {})
     edges: list[dict[str, Any]] = result.get("edges", [])
     if use_json:
@@ -214,6 +249,9 @@ def _passes_deps(use_json: bool, dot: bool, graph: bool) -> None:
         return
     if graph:
         _format_graph(edges)
+        return
+    if table:
+        _format_io_table(result.get("per_pass", []))
         return
     click.echo(format_row(["SRC", "DST", "RESOURCES"]))
     for e in edges:
@@ -280,6 +318,29 @@ def _format_graph(edges: list[dict[str, Any]]) -> None:
             click.echo(f"  {lbl[node]}  (sink){from_part}")
 
 
+def _format_ops(ops: list[Any]) -> str:
+    """Format load/store ops list to a compact string."""
+    if not ops:
+        return "-"
+    return ",".join(f"{t}={o}" for t, o in ops)
+
+
+def _format_io_table(per_pass: list[dict[str, Any]]) -> None:
+    write_tsv(
+        [
+            [
+                p.get("name", "-"),
+                ",".join(str(r) for r in p.get("reads", [])) or "-",
+                ",".join(str(r) for r in p.get("writes", [])) or "-",
+                _format_ops(p.get("load_ops", [])),
+                _format_ops(p.get("store_ops", [])),
+            ]
+            for p in per_pass
+        ],
+        header=["PASS", "READS", "WRITES", "LOAD", "STORE"],
+    )
+
+
 @click.command("pass")
 @click.argument("identifier", shell_complete=complete_pass_identifier)
 @click.option("--json", "use_json", is_flag=True, default=False, help="Output JSON.")
@@ -298,16 +359,46 @@ def pass_cmd(identifier: str, use_json: bool) -> None:
 
 
 def _format_pass_detail(data: dict[str, Any]) -> None:
-    color_ids = [str(t["id"]) for t in data.get("color_targets", [])]
+    color_targets = data.get("color_targets", [])
     depth = data.get("depth_target")
-    kv = {
+    kv: dict[str, Any] = {
         "Pass": data.get("name", "-"),
         "Begin EID": data.get("begin_eid", "-"),
         "End EID": data.get("end_eid", "-"),
         "Draw Calls": data.get("draws", 0),
         "Dispatches": data.get("dispatches", 0),
         "Triangles": data.get("triangles", 0),
-        "Color Targets": ", ".join(color_ids) if color_ids else "-",
-        "Depth Target": depth if depth else "-",
+        "Color Targets": ", ".join(_format_target(t) for t in color_targets)
+        if color_targets
+        else "-",
+        "Depth Target": _format_target(depth) if depth else "-",
     }
+    load_ops = data.get("load_ops", [])
+    store_ops = data.get("store_ops", [])
+    if load_ops:
+        kv["Load Ops"] = _format_ops(load_ops)
+    if store_ops:
+        kv["Store Ops"] = _format_ops(store_ops)
     click.echo(format_kv(kv))
+
+
+def _format_target(target: Any) -> str:
+    """Format an enriched attachment target dict for display."""
+    if isinstance(target, int):
+        return str(target)
+    if not isinstance(target, dict):
+        return str(target)
+    rid = str(target.get("id", "-"))
+    parts: list[str] = []
+    name = target.get("name")
+    if name:
+        parts.append(name)
+    fmt = target.get("format")
+    if fmt:
+        parts.append(fmt)
+    w, h = target.get("width"), target.get("height")
+    if w is not None and h is not None:
+        parts.append(f"{w}x{h}")
+    if parts:
+        return f"{rid} ({', '.join(parts)})"
+    return rid

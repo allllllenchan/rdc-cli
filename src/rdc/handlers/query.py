@@ -199,6 +199,13 @@ def _handle_passes(
 
     actions = state.adapter.get_root_actions()
     tree = get_pass_hierarchy(actions, state.structured_file)
+
+    if params.get("switches"):
+        from rdc.services.query_service import _count_rt_switches
+
+        for p in tree.get("passes", []):
+            p["rt_switches"] = _count_rt_switches(actions, p["begin_eid"], p["end_eid"])
+
     return _result_response(request_id, {"tree": tree}), True
 
 
@@ -229,14 +236,32 @@ def _handle_pass(
     if err is None:
         pipe = state.adapter.get_pipeline_state()
         detail["color_targets"] = [
-            {"id": int(t.resource)} for t in pipe.GetOutputTargets() if int(t.resource) != 0
+            _enrich_target(int(t.resource), state)
+            for t in pipe.GetOutputTargets()
+            if int(t.resource) != 0
         ]
         depth_id = int(pipe.GetDepthTarget().resource)
-        detail["depth_target"] = depth_id if depth_id != 0 else None
+        detail["depth_target"] = _enrich_target(depth_id, state) if depth_id != 0 else None
     else:
         detail["color_targets"] = []
         detail["depth_target"] = None
     return _result_response(request_id, detail), True
+
+
+def _enrich_target(rid: int, state: DaemonState) -> dict[str, Any]:
+    """Build an enriched attachment dict for a render target resource ID."""
+    entry: dict[str, Any] = {"id": rid}
+    name = state.res_names.get(rid, "")
+    if name:
+        entry["name"] = name
+    tex = state.tex_map.get(rid)
+    if tex is not None:
+        fmt = getattr(tex, "format", None)
+        if fmt and hasattr(fmt, "Name"):
+            entry["format"] = fmt.Name()
+        entry["width"] = tex.width
+        entry["height"] = tex.height
+    return entry
 
 
 def _handle_log(
@@ -364,7 +389,35 @@ def _handle_stats(
         }
         for a in top
     ]
-    return _result_response(request_id, {"per_pass": per_pass, "top_draws": top_draws}), True
+
+    # Largest resources by byte size
+    largest: list[dict[str, Any]] = []
+    for rid, res in state.res_rid_map.items():
+        size = getattr(res, "byteSize", 0)
+        if size <= 0:
+            continue
+        t = getattr(res, "type", None)
+        type_name = getattr(t, "name", str(t)) if t is not None else ""
+        fmt = "-"
+        tex = state.tex_map.get(rid)
+        if tex is not None:
+            f = getattr(tex, "format", None)
+            fmt = f.Name() if f and hasattr(f, "Name") else str(f) if f else "-"
+        largest.append(
+            {
+                "id": rid,
+                "name": getattr(res, "name", ""),
+                "type": type_name,
+                "size": size,
+                "format": fmt,
+            }
+        )
+    largest.sort(key=lambda r: r["size"], reverse=True)
+    largest = largest[:5]
+
+    return _result_response(
+        request_id, {"per_pass": per_pass, "top_draws": top_draws, "largest_resources": largest}
+    ), True
 
 
 def _handle_events(

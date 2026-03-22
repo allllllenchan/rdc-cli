@@ -12,7 +12,9 @@ from mock_renderdoc import (
     Descriptor,
     MockPipeState,
     ResourceDescription,
+    ResourceFormat,
     ResourceId,
+    ResourceType,
     SDBasic,
     SDChunk,
     SDData,
@@ -21,6 +23,7 @@ from mock_renderdoc import (
     ShaderReflection,
     ShaderStage,
     StructuredFile,
+    TextureDescription,
 )
 
 from rdc.daemon_server import DaemonState, _handle_request
@@ -114,6 +117,88 @@ class TestStatsHandler:
         state = DaemonState(capture="test.rdc", current_eid=0, token="tok")
         resp, _ = _handle_request(rpc_request("stats"), state)
         assert resp["error"]["code"] == -32002
+
+    def test_stats_largest_resources(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(97),
+                name="albedo",
+                type=ResourceType.Texture,
+                byteSize=4194304,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(200),
+                name="shadowmap",
+                type=ResourceType.Texture,
+                byteSize=1048576,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(10),
+                name="vbuf",
+                type=ResourceType.Buffer,
+                byteSize=65536,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        state.res_types = {int(r.resourceId): r.type.name for r in res}
+        state.tex_map = {
+            97: TextureDescription(
+                resourceId=ResourceId(97),
+                format=ResourceFormat(name="R8G8B8A8_UNORM"),
+            ),
+            200: TextureDescription(
+                resourceId=ResourceId(200),
+                format=ResourceFormat(name="D32_FLOAT"),
+            ),
+        }
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 3
+        assert largest[0]["id"] == 97
+        assert largest[0]["size"] == 4194304
+        assert largest[0]["format"] == "R8G8B8A8_UNORM"
+        assert largest[1]["id"] == 200
+        assert largest[2]["id"] == 10
+        assert largest[2]["format"] == "-"
+
+    def test_stats_largest_resources_fewer_than_5(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(1),
+                name="buf",
+                type=ResourceType.Buffer,
+                byteSize=1024,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 1
+        assert largest[0]["size"] == 1024
+
+    def test_stats_largest_resources_excludes_zero_size(self):
+        state = _make_state()
+        res = [
+            ResourceDescription(
+                resourceId=ResourceId(1),
+                name="nosize",
+                type=ResourceType.Buffer,
+                byteSize=0,
+            ),
+            ResourceDescription(
+                resourceId=ResourceId(2),
+                name="hassize",
+                type=ResourceType.Buffer,
+                byteSize=512,
+            ),
+        ]
+        state.res_rid_map = {int(r.resourceId): r for r in res}
+        resp, _ = _handle_request(rpc_request("stats"), state)
+        largest = resp["result"]["largest_resources"]
+        assert len(largest) == 1
+        assert largest[0]["name"] == "hassize"
 
 
 class TestEventsHandler:
@@ -319,7 +404,91 @@ class TestPassHandler:
         result = resp["result"]
         assert len(result["color_targets"]) == 1
         assert result["color_targets"][0]["id"] == 10
-        assert result["depth_target"] == 20
+        assert result["depth_target"]["id"] == 20
+
+    def test_pass_enriched_targets(self):
+        state = _make_pass_state()
+        state.tex_map = {
+            10: TextureDescription(
+                resourceId=ResourceId(10),
+                width=1920,
+                height=1080,
+                format=ResourceFormat(name="R8G8B8A8_UNORM"),
+            ),
+            20: TextureDescription(
+                resourceId=ResourceId(20),
+                width=1920,
+                height=1080,
+                format=ResourceFormat(name="D32_FLOAT"),
+            ),
+        }
+        state.res_names = {10: "albedo", 20: "depth"}
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0["id"] == 10
+        assert c0["name"] == "albedo"
+        assert c0["format"] == "R8G8B8A8_UNORM"
+        assert c0["width"] == 1920
+        assert c0["height"] == 1080
+        dt = result["depth_target"]
+        assert dt["id"] == 20
+        assert dt["name"] == "depth"
+        assert dt["format"] == "D32_FLOAT"
+
+    def test_pass_unknown_resource_fallback(self):
+        """Unknown resource ID (not in tex_map) falls back to ID-only."""
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), _make_pass_state())
+        result = resp["result"]
+        c0 = result["color_targets"][0]
+        assert c0 == {"id": 10}
+        assert result["depth_target"] == {"id": 20}
+
+    def test_pass_no_color_targets(self):
+        """Pass with no color attachments, only depth."""
+        actions = _build_pass_actions()
+        sf = _build_sf()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(20)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        assert result["color_targets"] == []
+        assert result["depth_target"]["id"] == 20
+
+    def test_pass_no_depth(self):
+        """Pass with no depth target."""
+        actions = _build_pass_actions()
+        sf = _build_sf()
+        pipe = SimpleNamespace(
+            GetOutputTargets=lambda: [SimpleNamespace(resource=_IntLike(10))],
+            GetDepthTarget=lambda: SimpleNamespace(resource=_IntLike(0)),
+        )
+        ctrl = SimpleNamespace(
+            GetRootActions=lambda: actions,
+            GetResources=lambda: [],
+            GetAPIProperties=lambda: SimpleNamespace(pipelineType="Vulkan"),
+            GetPipelineState=lambda: pipe,
+            SetFrameEvent=lambda eid, force: None,
+            GetStructuredFile=lambda: sf,
+            Shutdown=lambda: None,
+        )
+        state = make_daemon_state(ctrl=ctrl, version=(1, 33), max_eid=300, structured_file=sf)
+        resp, _ = _handle_request(rpc_request("pass", {"index": 0}), state)
+        result = resp["result"]
+        assert len(result["color_targets"]) == 1
+        assert result["depth_target"] is None
 
 
 class TestLogHandler:

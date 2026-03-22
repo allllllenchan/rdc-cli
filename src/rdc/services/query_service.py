@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -162,7 +163,7 @@ def filter_by_pass(
     `a.pass_name` string comparison when no pass matches or `actions` is None.
     """
     if actions is not None:
-        passes = _build_pass_list(actions, sf)
+        passes = _pass_list_with_fallback(actions, sf)
         target = next((p for p in passes if p["name"].lower() == pass_name.lower()), None)
         if target:
             return [a for a in flat if target["begin_eid"] <= a.eid <= target["end_eid"]]
@@ -248,7 +249,7 @@ def _count_events_recursive(actions: list[Any]) -> int:
 
 
 def _count_passes(actions: list[Any]) -> int:
-    return len(_build_pass_list(actions))
+    return len(_pass_list_with_fallback(actions))
 
 
 def count_from_actions(
@@ -444,8 +445,8 @@ def get_resource_detail(adapter: Any, resid: int) -> dict[str, Any] | None:
 
 def get_pass_hierarchy(actions: list[Any], sf: Any = None) -> dict[str, Any]:
     """Get render pass hierarchy from actions."""
-    enriched = _build_pass_list(actions, sf)
-    return {"passes": [{"name": p["name"], "draws": p["draws"]} for p in enriched]}
+    enriched = _pass_list_with_fallback(actions, sf)
+    return {"passes": enriched}
 
 
 def _subtree_has_draws(action: Any) -> bool:
@@ -547,6 +548,26 @@ def pass_name_for_eid(eid: int, passes: list[dict[str, Any]]) -> str:
     return "-"
 
 
+_LOAD_STORE_RE = re.compile(r"(C|DS|D|S)=([^,)]+)")
+
+
+def _parse_load_store_ops(begin_name: str, end_name: str) -> dict[str, list[tuple[str, str]]]:
+    """Extract load/store ops from BeginPass/EndPass action name strings.
+
+    Args:
+        begin_name: e.g. ``"vkCmdBeginRenderPass(C=Clear, D=Load)"``
+        end_name: e.g. ``"vkCmdEndRenderPass(C=Store, DS=Don't Care)"``
+
+    Returns:
+        Dict with ``load_ops`` and ``store_ops``, each a list of
+        ``(target, op)`` tuples.  Uses a list (not dict) because
+        multi-RT captures may repeat keys like ``C=``.
+    """
+    load_ops = _LOAD_STORE_RE.findall(begin_name) if begin_name else []
+    store_ops = _LOAD_STORE_RE.findall(end_name) if end_name else []
+    return {"load_ops": load_ops, "store_ops": store_ops}
+
+
 def _build_pass_list(actions: list[Any], sf: Any = None) -> list[dict[str, Any]]:
     """Build enriched pass list with begin/end EID, draws, dispatches, triangles."""
     passes: list[dict[str, Any]] = []
@@ -570,6 +591,7 @@ def _build_pass_list_recursive(
 
         if is_begin:
             api_name = a.GetName(sf) if sf is not None else getattr(a, "_name", "")
+            before = len(passes)
             if a.children:
                 # Children-of-BeginPass: real API and mock tree patterns
                 content = a.children
@@ -584,6 +606,14 @@ def _build_pass_list_recursive(
                     if "(" in api_name:
                         entry["name"] = _friendly_pass_name(api_name, len(passes))
                     passes.append(entry)
+                # Find EndPass sibling for store ops
+                end_name = ""
+                if i + 1 < len(actions) and int(actions[i + 1].flags) & _END_PASS:
+                    end_name = (
+                        actions[i + 1].GetName(sf)
+                        if sf is not None
+                        else getattr(actions[i + 1], "_name", "")
+                    )
                 i += 1
             else:
                 # Flat-sibling: collect window between BeginPass and EndPass
@@ -605,12 +635,198 @@ def _build_pass_list_recursive(
                     if "(" in api_name:
                         entry["name"] = _friendly_pass_name(api_name, len(passes))
                     passes.append(entry)
+                end_name = ""
+                if j < len(actions) and int(actions[j].flags) & _END_PASS:
+                    end_name = (
+                        actions[j].GetName(sf)
+                        if sf is not None
+                        else getattr(actions[j], "_name", "")
+                    )
                 i = j
+            # Attach load/store ops to all passes added in this block
+            ops = _parse_load_store_ops(api_name, end_name)
+            for idx in range(before, len(passes)):
+                passes[idx]["load_ops"] = ops["load_ops"]
+                passes[idx]["store_ops"] = ops["store_ops"]
         elif a.children:
             _build_pass_list_recursive(a.children, passes, sf)
             i += 1
         else:
             i += 1
+
+
+_SYNTHETIC_MARKER_IGNORE: frozenset[str] = frozenset(
+    {"RenderLoop.Draw", "Frame", "Render", "DrawOpaqueObjects", "Scene", "Main"}
+)
+
+_DRAW_OR_DISPATCH_OR_CLEAR = _DRAWCALL | _MESHDRAW | _DISPATCH | _CLEAR
+
+
+def _rt_key(action: Any) -> tuple[int, ...]:
+    """Extract normalized RT tuple from action outputs/depthOut.
+
+    Strips trailing zero-valued slots so that unused padding doesn't
+    create false pass boundaries.
+    """
+    outputs: list[int] = [int(x) for x in action.outputs]
+    while outputs and outputs[-1] == 0:
+        outputs.pop()
+    return tuple(outputs) + (int(action.depthOut),)
+
+
+def _nearest_marker(action: Any, sf: Any = None) -> str | None:
+    """Walk up the action tree to find nearest PushMarker name, skipping ignored."""
+    node = getattr(action, "parent", None)
+    while node is not None:
+        if int(node.flags) & _PUSH_MARKER:
+            name: str = node.GetName(sf) if sf is not None else getattr(node, "_name", "")
+            if name and name not in _SYNTHETIC_MARKER_IGNORE:
+                return name
+        node = getattr(node, "parent", None)
+    return None
+
+
+def _friendly_rt_name(rt_key: tuple[int, ...], index: int) -> str:
+    """Generate a readable pass name from RT key for synthetic passes."""
+    non_zero = [v for v in rt_key[:-1] if v != 0]
+    has_depth = rt_key[-1] != 0
+    parts: list[str] = []
+    if non_zero:
+        n = len(non_zero)
+        parts.append(f"{n} Target{'s' if n > 1 else ''}")
+    if has_depth:
+        parts.append("Depth")
+    suffix = f" ({' + '.join(parts)})" if parts else ""
+    return f"Colour Pass #{index + 1}{suffix}"
+
+
+def _build_synthetic_pass_list(actions: list[Any], sf: Any = None) -> list[dict[str, Any]]:
+    """Infer passes from render target changes for APIs without BeginPass/EndPass.
+
+    Walks all actions recursively and groups consecutive draw/dispatch/clear
+    actions that share the same (outputs, depthOut) tuple into synthetic passes.
+    """
+    leaf_actions: list[Any] = []
+
+    def _collect_leaves(nodes: list[Any]) -> None:
+        for a in nodes:
+            flags = int(a.flags)
+            if flags & _DRAW_OR_DISPATCH_OR_CLEAR:
+                leaf_actions.append(a)
+            if a.children:
+                _collect_leaves(a.children)
+
+    _collect_leaves(actions)
+
+    if not leaf_actions:
+        return []
+
+    passes: list[dict[str, Any]] = []
+    cur_key = _rt_key(leaf_actions[0])
+    cur_draws = 0
+    cur_dispatches = 0
+    cur_triangles = 0
+    cur_begin_eid = leaf_actions[0].eventId
+    cur_end_eid = leaf_actions[0].eventId
+    cur_marker: str | None = _nearest_marker(leaf_actions[0], sf)
+
+    def _flush() -> None:
+        nonlocal cur_draws, cur_dispatches, cur_triangles, cur_begin_eid, cur_end_eid, cur_marker
+        if cur_draws == 0 and cur_dispatches == 0:
+            return
+        name = cur_marker if cur_marker else _friendly_rt_name(cur_key, len(passes))
+        passes.append(
+            {
+                "name": name,
+                "begin_eid": cur_begin_eid,
+                "end_eid": cur_end_eid,
+                "draws": cur_draws,
+                "dispatches": cur_dispatches,
+                "triangles": cur_triangles,
+                "load_ops": [],
+                "store_ops": [],
+            }
+        )
+
+    for a in leaf_actions:
+        flags = int(a.flags)
+        key = _rt_key(a)
+        if key != cur_key:
+            _flush()
+            cur_key = key
+            cur_draws = 0
+            cur_dispatches = 0
+            cur_triangles = 0
+            cur_begin_eid = a.eventId
+            cur_end_eid = a.eventId
+            cur_marker = _nearest_marker(a, sf)
+
+        cur_end_eid = a.eventId
+        if flags & (_DRAWCALL | _MESHDRAW):
+            cur_draws += 1
+            cur_triangles += (a.numIndices // 3) * max(a.numInstances, 1)
+        elif flags & _DISPATCH:
+            cur_dispatches += 1
+        if cur_marker is None:
+            cur_marker = _nearest_marker(a, sf)
+
+    _flush()
+    return passes
+
+
+def _count_rt_switches(
+    actions: list[Any],
+    begin_eid: int,
+    end_eid: int,
+) -> dict[str, Any]:
+    """Count render-target switches within a pass EID range.
+
+    Args:
+        actions: Root action list from ReplayController.
+        begin_eid: First EID of the pass (inclusive).
+        end_eid: Last EID of the pass (inclusive).
+
+    Returns:
+        Dict with ``count`` (int) and ``switches`` list of dicts
+        containing ``eid``, ``from_targets``, and ``to_targets``.
+    """
+    leaf_actions: list[Any] = []
+
+    def _collect(nodes: list[Any]) -> None:
+        for a in nodes:
+            flags = int(a.flags)
+            if flags & _DRAW_OR_DISPATCH_OR_CLEAR:
+                if begin_eid <= a.eventId <= end_eid:
+                    leaf_actions.append(a)
+            if a.children:
+                _collect(a.children)
+
+    _collect(actions)
+    leaf_actions.sort(key=lambda a: a.eventId)
+
+    switches: list[dict[str, Any]] = []
+    prev_key: tuple[int, ...] | None = None
+    for a in leaf_actions:
+        key = _rt_key(a)
+        if prev_key is not None and key != prev_key:
+            switches.append(
+                {
+                    "eid": a.eventId,
+                    "from_targets": prev_key,
+                    "to_targets": key,
+                }
+            )
+        prev_key = key
+
+    return {"count": len(switches), "switches": switches}
+
+
+def _pass_list_with_fallback(actions: list[Any], sf: Any = None) -> list[dict[str, Any]]:
+    """Build pass list, falling back to synthetic RT inference if no API passes found."""
+    passes = _build_pass_list(actions, sf)
+    if not passes:
+        passes = _build_synthetic_pass_list(actions, sf)
+    return passes
 
 
 def get_pass_detail(
@@ -619,7 +835,7 @@ def get_pass_detail(
     identifier: int | str = 0,
 ) -> dict[str, Any] | None:
     """Get detail for a single pass by index (int) or name (str)."""
-    passes = _build_pass_list(actions, sf)
+    passes = _pass_list_with_fallback(actions, sf)
     if isinstance(identifier, int):
         return passes[identifier] if 0 <= identifier < len(passes) else None
     lower = identifier.lower()
@@ -695,10 +911,21 @@ def build_pass_deps(
         usage_data: Map of resource ID to list of EventUsage objects.
 
     Returns:
-        Dict with "edges" key containing list of edge dicts.
+        Dict with ``edges`` (list of edge dicts) and ``per_pass``
+        (list of per-pass I/O dicts with reads, writes, load_ops, store_ops).
     """
     if not passes or not usage_data:
-        return {"edges": []}
+        per_pass = [
+            {
+                "name": p["name"],
+                "reads": [],
+                "writes": [],
+                "load_ops": p.get("load_ops", []),
+                "store_ops": p.get("store_ops", []),
+            }
+            for p in passes
+        ]
+        return {"edges": [], "per_pass": per_pass}
 
     n = len(passes)
     writes: list[set[int]] = [set() for _ in range(n)]
@@ -738,7 +965,18 @@ def build_pass_deps(
                         "resources": sorted(shared),
                     }
                 )
-    return {"edges": edges}
+
+    per_pass = [
+        {
+            "name": passes[i]["name"],
+            "reads": sorted(reads[i]),
+            "writes": sorted(writes[i]),
+            "load_ops": passes[i].get("load_ops", []),
+            "store_ops": passes[i].get("store_ops", []),
+        }
+        for i in range(n)
+    ]
+    return {"edges": edges, "per_pass": per_pass}
 
 
 def _bucket_eid(eid: int, passes: list[dict[str, Any]]) -> int:
@@ -746,3 +984,121 @@ def _bucket_eid(eid: int, passes: list[dict[str, Any]]) -> int:
         if p["begin_eid"] <= eid <= p["end_eid"]:
             return i
     return -1
+
+
+# ---------------------------------------------------------------------------
+# Unused render targets
+# ---------------------------------------------------------------------------
+
+_DEPTH_STENCIL_USAGE: int = 33  # DepthStencilTarget
+
+
+def find_unused_targets(
+    passes: list[dict[str, Any]],
+    usage_data: dict[int, list[Any]],
+    res_names: dict[int, str],
+    swapchain_ids: set[int],
+) -> dict[str, Any]:
+    """Detect render targets written but never consumed by visible output.
+
+    Args:
+        passes: Pass list from ``_build_pass_list()``.
+        usage_data: Resource ID -> EventUsage list.
+        res_names: Resource ID -> human-readable name.
+        swapchain_ids: Resource IDs identified as swapchain images.
+
+    Returns:
+        Dict with ``unused`` list and ``waves`` count.
+    """
+    if not passes or not usage_data:
+        return {"unused": [], "waves": 0}
+
+    n = len(passes)
+    writes: list[set[int]] = [set() for _ in range(n)]
+    reads: list[set[int]] = [set() for _ in range(n)]
+    depth_resources: set[int] = set()
+
+    out_of_pass_reads: set[int] = set()
+
+    for rid, events in usage_data.items():
+        if rid == 0:
+            continue
+        for ev in events:
+            eid = ev.eventId
+            usage_val = int(ev.usage)
+            pidx = _bucket_eid(eid, passes)
+            if pidx < 0:
+                if usage_val in _READ_USAGES:
+                    out_of_pass_reads.add(rid)
+                continue
+            if usage_val in _WRITE_USAGES:
+                writes[pidx].add(rid)
+                if usage_val == _DEPTH_STENCIL_USAGE:
+                    depth_resources.add(rid)
+            elif usage_val in _READ_USAGES:
+                reads[pidx].add(rid)
+
+    res_writers: dict[int, list[int]] = {}
+    res_readers: dict[int, list[int]] = {}
+    for pidx in range(n):
+        for rid in writes[pidx]:
+            res_writers.setdefault(rid, []).append(pidx)
+        for rid in reads[pidx]:
+            res_readers.setdefault(rid, []).append(pidx)
+
+    all_written: set[int] = set()
+    for ws in writes:
+        all_written |= ws
+
+    # Mark live: swapchain + depth/stencil + out-of-pass consumers are always live
+    live: set[int] = swapchain_ids | depth_resources | (out_of_pass_reads & all_written)
+
+    # Reverse-walk: if a pass writes a live resource, its read inputs are live
+    changed = True
+    while changed:
+        changed = False
+        for pidx in range(n):
+            if writes[pidx] & live:
+                for rid in reads[pidx]:
+                    if rid not in live and rid in all_written:
+                        live.add(rid)
+                        changed = True
+
+    unused_rids = all_written - live
+    if not unused_rids:
+        return {"unused": [], "waves": 0}
+
+    # Assign wave numbers via iterative leaf pruning
+    remaining = set(unused_rids)
+    wave_map: dict[int, int] = {}
+    wave = 0
+
+    while remaining:
+        wave += 1
+        leaf_dead: set[int] = set()
+        for rid in remaining:
+            reader_passes = res_readers.get(rid, [])
+            feeds_remaining = any(writes[rp] & remaining - {rid} for rp in reader_passes)
+            if not feeds_remaining:
+                leaf_dead.add(rid)
+        if not leaf_dead:
+            for rid in remaining:
+                wave_map[rid] = wave
+            remaining.clear()
+        else:
+            for rid in leaf_dead:
+                wave_map[rid] = wave
+            remaining -= leaf_dead
+
+    unused_list = []
+    for rid in sorted(unused_rids):
+        writer_names = sorted({passes[pidx]["name"] for pidx in res_writers.get(rid, [])})
+        unused_list.append(
+            {
+                "id": rid,
+                "name": res_names.get(rid, ""),
+                "written_by": writer_names,
+                "wave": wave_map[rid],
+            }
+        )
+    return {"unused": unused_list, "waves": wave}

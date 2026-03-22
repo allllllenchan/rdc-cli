@@ -6,17 +6,21 @@ from mock_renderdoc import (
     ActionDescription,
     ActionFlags,
     APIEvent,
+    ResourceId,
 )
 
 from rdc.services.query_service import (
     _build_pass_list,
+    _build_synthetic_pass_list,
     _friendly_pass_name,
+    _parse_load_store_ops,
     aggregate_stats,
     filter_by_pass,
     filter_by_pattern,
     filter_by_type,
     find_action_by_eid,
     get_pass_detail,
+    get_pass_hierarchy,
     get_top_draws,
     pipeline_row,
     walk_actions,
@@ -558,3 +562,489 @@ class TestPipelineRowTopology:
         )()
         row = pipeline_row(10, "Vulkan", pipe)
         assert row["topology"] == "TriangleList"
+
+
+# ---------------------------------------------------------------------------
+# T2: _parse_load_store_ops
+# ---------------------------------------------------------------------------
+
+
+class TestParseLoadStoreOps:
+    def test_vulkan_begin_end(self) -> None:
+        result = _parse_load_store_ops(
+            "vkCmdBeginRenderPass(C=Clear, D=Load)",
+            "vkCmdEndRenderPass(C=Store, DS=Don't Care)",
+        )
+        assert result["load_ops"] == [("C", "Clear"), ("D", "Load")]
+        assert result["store_ops"] == [("C", "Store"), ("DS", "Don't Care")]
+
+    def test_multi_rt_repeated_c(self) -> None:
+        result = _parse_load_store_ops(
+            "vkCmdBeginRenderPass(C=Clear, C=Load, D=Clear)",
+            "vkCmdEndRenderPass(C=Store, C=Don't Care, DS=Don't Care)",
+        )
+        assert result["load_ops"] == [("C", "Clear"), ("C", "Load"), ("D", "Clear")]
+        assert result["store_ops"] == [
+            ("C", "Store"),
+            ("C", "Don't Care"),
+            ("DS", "Don't Care"),
+        ]
+
+    def test_dynamic_rendering(self) -> None:
+        result = _parse_load_store_ops(
+            "vkCmdBeginRendering(C=Clear, D=Clear)",
+            "vkCmdEndRendering(C=Store, D=Store)",
+        )
+        assert result["load_ops"] == [("C", "Clear"), ("D", "Clear")]
+        assert result["store_ops"] == [("C", "Store"), ("D", "Store")]
+
+    def test_missing_end_pass(self) -> None:
+        result = _parse_load_store_ops("vkCmdBeginRenderPass(C=Clear)", "")
+        assert result["load_ops"] == [("C", "Clear")]
+        assert result["store_ops"] == []
+
+    def test_gl_no_ops(self) -> None:
+        result = _parse_load_store_ops("glBeginQuery", "glEndQuery")
+        assert result["load_ops"] == []
+        assert result["store_ops"] == []
+
+    def test_empty_strings(self) -> None:
+        result = _parse_load_store_ops("", "")
+        assert result["load_ops"] == []
+        assert result["store_ops"] == []
+
+    def test_ds_combined_key(self) -> None:
+        result = _parse_load_store_ops(
+            "vkCmdBeginRenderPass(DS=Clear)",
+            "vkCmdEndRenderPass(DS=Store)",
+        )
+        assert result["load_ops"] == [("DS", "Clear")]
+        assert result["store_ops"] == [("DS", "Store")]
+
+    def test_separate_d_and_s(self) -> None:
+        result = _parse_load_store_ops(
+            "vkCmdBeginRenderPass(D=Clear, S=Load)",
+            "vkCmdEndRenderPass(D=Store, S=Don't Care)",
+        )
+        assert result["load_ops"] == [("D", "Clear"), ("S", "Load")]
+        assert result["store_ops"] == [("D", "Store"), ("S", "Don't Care")]
+
+
+# ---------------------------------------------------------------------------
+# T1+T2: get_pass_hierarchy surfaces all fields
+# ---------------------------------------------------------------------------
+
+
+class TestPassHierarchyFullFields:
+    def test_all_fields_present(self) -> None:
+        begin = ActionDescription(
+            eventId=10,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name="vkCmdBeginRenderPass(C=Clear, D=Load)",
+        )
+        draw = ActionDescription(eventId=11, flags=ActionFlags.Drawcall, numIndices=6, _name="draw")
+        end = ActionDescription(
+            eventId=12,
+            flags=ActionFlags.EndPass | ActionFlags.PassBoundary,
+            _name="vkCmdEndRenderPass(C=Store, DS=Don't Care)",
+        )
+        tree = get_pass_hierarchy([begin, draw, end])
+        p = tree["passes"][0]
+        assert p["draws"] == 1
+        assert p["dispatches"] == 0
+        assert p["triangles"] == 2
+        assert p["begin_eid"] == 10
+        assert p["end_eid"] == 11
+        assert p["load_ops"] == [("C", "Clear"), ("D", "Load")]
+        assert p["store_ops"] == [("C", "Store"), ("DS", "Don't Care")]
+
+    def test_children_pattern_with_ops(self) -> None:
+        begin = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name="vkCmdBeginRenderPass(C=Clear)",
+        )
+        begin.children = [
+            ActionDescription(eventId=2, flags=ActionFlags.Drawcall, numIndices=3, _name="d"),
+        ]
+        end = ActionDescription(
+            eventId=3,
+            flags=ActionFlags.EndPass | ActionFlags.PassBoundary,
+            _name="vkCmdEndRenderPass(C=Store)",
+        )
+        passes = _build_pass_list([begin, end])
+        assert len(passes) == 1
+        assert passes[0]["load_ops"] == [("C", "Clear")]
+        assert passes[0]["store_ops"] == [("C", "Store")]
+
+    def test_no_end_pass_empty_store_ops(self) -> None:
+        begin = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name="vkCmdBeginRenderPass(C=Load)",
+        )
+        draw = ActionDescription(eventId=2, flags=ActionFlags.Drawcall, numIndices=3, _name="d")
+        # No EndPass action at all
+        passes = _build_pass_list([begin, draw])
+        assert len(passes) == 1
+        assert passes[0]["load_ops"] == [("C", "Load")]
+        assert passes[0]["store_ops"] == []
+
+    def test_gl_pass_empty_ops(self) -> None:
+        begin = ActionDescription(
+            eventId=10,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name="glBeginQuery",
+        )
+        draw = ActionDescription(eventId=11, flags=ActionFlags.Drawcall, numIndices=3, _name="draw")
+        end = ActionDescription(
+            eventId=12,
+            flags=ActionFlags.EndPass | ActionFlags.PassBoundary,
+            _name="glEndQuery",
+        )
+        tree = get_pass_hierarchy([begin, draw, end])
+        p = tree["passes"][0]
+        assert p["load_ops"] == []
+        assert p["store_ops"] == []
+
+
+# ---------------------------------------------------------------------------
+# T5: Synthetic pass inference (GL/GLES/D3D11)
+# ---------------------------------------------------------------------------
+
+
+def _make_outputs(*rids: int) -> list[ResourceId]:
+    """Build 8-element outputs list from non-zero resource IDs."""
+    out = [ResourceId(r) for r in rids]
+    out += [ResourceId(0)] * (8 - len(out))
+    return out
+
+
+class TestActionDescriptionOutputs:
+    """Verify mock ActionDescription has outputs/depthOut fields."""
+
+    def test_default_outputs(self) -> None:
+        a = ActionDescription(eventId=1, flags=ActionFlags.Drawcall)
+        assert len(a.outputs) == 8
+        assert all(int(o) == 0 for o in a.outputs)
+        assert int(a.depthOut) == 0
+
+    def test_custom_outputs(self) -> None:
+        a = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.Drawcall,
+            outputs=_make_outputs(10, 20),
+            depthOut=ResourceId(30),
+        )
+        assert int(a.outputs[0]) == 10
+        assert int(a.outputs[1]) == 20
+        assert int(a.outputs[2]) == 0
+        assert int(a.depthOut) == 30
+
+
+class TestSyntheticPassSameRT:
+    """3 actions with same RT -> 1 pass."""
+
+    def test_single_pass(self) -> None:
+        rt = _make_outputs(100)
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=rt,
+                depthOut=ResourceId(200),
+                _name="draw1",
+            ),
+            ActionDescription(
+                eventId=2,
+                flags=ActionFlags.Drawcall,
+                numIndices=9,
+                outputs=rt,
+                depthOut=ResourceId(200),
+                _name="draw2",
+            ),
+            ActionDescription(
+                eventId=3,
+                flags=ActionFlags.Drawcall,
+                numIndices=12,
+                outputs=rt,
+                depthOut=ResourceId(200),
+                _name="draw3",
+            ),
+        ]
+        passes = _build_synthetic_pass_list(actions)
+        assert len(passes) == 1
+        assert passes[0]["draws"] == 3
+        assert passes[0]["begin_eid"] == 1
+        assert passes[0]["end_eid"] == 3
+        assert passes[0]["triangles"] == (2 + 3 + 4)
+        assert passes[0]["load_ops"] == []
+        assert passes[0]["store_ops"] == []
+
+
+class TestSyntheticPassRTChange:
+    """RT change between actions -> 2 passes."""
+
+    def test_two_passes(self) -> None:
+        rt1 = _make_outputs(100)
+        rt2 = _make_outputs(200)
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=rt1,
+                depthOut=ResourceId(10),
+                _name="draw1",
+            ),
+            ActionDescription(
+                eventId=2,
+                flags=ActionFlags.Drawcall,
+                numIndices=9,
+                outputs=rt2,
+                depthOut=ResourceId(10),
+                _name="draw2",
+            ),
+        ]
+        passes = _build_synthetic_pass_list(actions)
+        assert len(passes) == 2
+        assert passes[0]["begin_eid"] == 1
+        assert passes[0]["end_eid"] == 1
+        assert passes[1]["begin_eid"] == 2
+        assert passes[1]["end_eid"] == 2
+
+
+class TestSyntheticPassZeroPadding:
+    """Same non-zero RTs + different zero padding = same pass."""
+
+    def test_zero_padding_no_false_boundary(self) -> None:
+        out1 = [ResourceId(100)] + [ResourceId(0)] * 7
+        out2 = [ResourceId(100)] + [ResourceId(0)] * 7
+        # Different instances but same values
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=out1,
+                depthOut=ResourceId(50),
+                _name="draw1",
+            ),
+            ActionDescription(
+                eventId=2,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=out2,
+                depthOut=ResourceId(50),
+                _name="draw2",
+            ),
+        ]
+        passes = _build_synthetic_pass_list(actions)
+        assert len(passes) == 1
+
+
+class TestSyntheticPassEmpty:
+    """Empty action tree -> empty pass list."""
+
+    def test_empty(self) -> None:
+        assert _build_synthetic_pass_list([]) == []
+
+    def test_no_draw_actions(self) -> None:
+        actions = [
+            ActionDescription(eventId=1, flags=ActionFlags.PushMarker, _name="Frame"),
+        ]
+        assert _build_synthetic_pass_list(actions) == []
+
+
+class TestSyntheticPassMarkerNaming:
+    """Actions under a PushMarker get that name."""
+
+    def test_marker_name_used(self) -> None:
+        draw = ActionDescription(
+            eventId=2,
+            flags=ActionFlags.Drawcall,
+            numIndices=6,
+            outputs=_make_outputs(100),
+            depthOut=ResourceId(50),
+            _name="glDrawArrays",
+        )
+        marker = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.PushMarker,
+            _name="ShadowPass",
+            children=[draw],
+        )
+        draw.parent = marker
+        passes = _build_synthetic_pass_list([marker])
+        assert len(passes) == 1
+        assert passes[0]["name"] == "ShadowPass"
+
+
+class TestSyntheticPassEngineMarkerFiltering:
+    """Engine-internal markers like 'Frame' are skipped."""
+
+    def test_frame_marker_skipped(self) -> None:
+        draw = ActionDescription(
+            eventId=3,
+            flags=ActionFlags.Drawcall,
+            numIndices=6,
+            outputs=_make_outputs(100),
+            depthOut=ResourceId(0),
+            _name="glDrawArrays",
+        )
+        inner_marker = ActionDescription(
+            eventId=2,
+            flags=ActionFlags.PushMarker,
+            _name="GBufferPass",
+            children=[draw],
+        )
+        draw.parent = inner_marker
+        frame_marker = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.PushMarker,
+            _name="Frame",
+            children=[inner_marker],
+        )
+        inner_marker.parent = frame_marker
+        passes = _build_synthetic_pass_list([frame_marker])
+        assert len(passes) == 1
+        assert passes[0]["name"] == "GBufferPass"
+
+    def test_no_good_marker_uses_friendly_name(self) -> None:
+        draw = ActionDescription(
+            eventId=2,
+            flags=ActionFlags.Drawcall,
+            numIndices=6,
+            outputs=_make_outputs(100, 200),
+            depthOut=ResourceId(50),
+            _name="glDrawArrays",
+        )
+        frame_marker = ActionDescription(
+            eventId=1,
+            flags=ActionFlags.PushMarker,
+            _name="Frame",
+            children=[draw],
+        )
+        draw.parent = frame_marker
+        passes = _build_synthetic_pass_list([frame_marker])
+        assert len(passes) == 1
+        assert passes[0]["name"] == "Colour Pass #1 (2 Targets + Depth)"
+
+
+class TestSyntheticPassD3D11Style:
+    """D3D11-style actions with different RT tuples -> correct passes."""
+
+    def test_d3d11_rt_switch(self) -> None:
+        rt_shadow = _make_outputs(10)
+        rt_gbuffer = _make_outputs(20, 21)
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=300,
+                outputs=rt_shadow,
+                depthOut=ResourceId(30),
+                _name="Draw",
+            ),
+            ActionDescription(
+                eventId=2,
+                flags=ActionFlags.Drawcall,
+                numIndices=600,
+                outputs=rt_shadow,
+                depthOut=ResourceId(30),
+                _name="Draw",
+            ),
+            ActionDescription(
+                eventId=3,
+                flags=ActionFlags.Drawcall,
+                numIndices=900,
+                outputs=rt_gbuffer,
+                depthOut=ResourceId(31),
+                _name="Draw",
+            ),
+            ActionDescription(
+                eventId=4,
+                flags=ActionFlags.Dispatch,
+                outputs=_make_outputs(),
+                depthOut=ResourceId(0),
+                _name="Dispatch",
+            ),
+        ]
+        passes = _build_synthetic_pass_list(actions)
+        assert len(passes) == 3
+        assert passes[0]["draws"] == 2
+        assert passes[0]["triangles"] == 100 + 200
+        assert passes[1]["draws"] == 1
+        assert passes[1]["begin_eid"] == 3
+        assert passes[2]["dispatches"] == 1
+        assert passes[2]["draws"] == 0
+
+
+class TestSyntheticPassIntegrationVulkan:
+    """Vulkan capture with BeginPass -> _build_pass_list() used, no fallback."""
+
+    def test_vulkan_no_fallback(self) -> None:
+        begin = ActionDescription(
+            eventId=10,
+            flags=ActionFlags.BeginPass | ActionFlags.PassBoundary,
+            _name="vkCmdBeginRenderPass(C=Clear)",
+        )
+        draw = ActionDescription(eventId=11, flags=ActionFlags.Drawcall, numIndices=6, _name="d")
+        end = ActionDescription(
+            eventId=12,
+            flags=ActionFlags.EndPass | ActionFlags.PassBoundary,
+            _name="vkCmdEndRenderPass(C=Store)",
+        )
+        tree = get_pass_hierarchy([begin, draw, end])
+        passes = tree["passes"]
+        assert len(passes) == 1
+        assert "load_ops" in passes[0]
+        assert passes[0]["load_ops"] == [("C", "Clear")]
+
+
+class TestSyntheticPassIntegrationGL:
+    """GL-style capture (no BeginPass) -> synthetic passes inferred."""
+
+    def test_gl_synthetic_fallback(self) -> None:
+        rt = _make_outputs(100)
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=rt,
+                depthOut=ResourceId(50),
+                _name="glDrawArrays",
+            ),
+            ActionDescription(
+                eventId=2,
+                flags=ActionFlags.Drawcall,
+                numIndices=9,
+                outputs=rt,
+                depthOut=ResourceId(50),
+                _name="glDrawElements",
+            ),
+        ]
+        tree = get_pass_hierarchy(actions)
+        passes = tree["passes"]
+        assert len(passes) == 1
+        assert passes[0]["draws"] == 2
+        assert passes[0]["load_ops"] == []
+        assert passes[0]["store_ops"] == []
+
+    def test_gl_pass_detail_works(self) -> None:
+        rt = _make_outputs(100)
+        actions = [
+            ActionDescription(
+                eventId=1,
+                flags=ActionFlags.Drawcall,
+                numIndices=6,
+                outputs=rt,
+                depthOut=ResourceId(50),
+                _name="glDrawArrays",
+            ),
+        ]
+        detail = get_pass_detail(actions, None, 0)
+        assert detail is not None
+        assert detail["draws"] == 1
