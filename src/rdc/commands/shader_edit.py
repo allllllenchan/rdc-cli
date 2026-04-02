@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
 
-from rdc.commands._helpers import call, complete_eid
+from rdc.commands._helpers import call, complete_eid, resolve_shader_target_eid
 from rdc.formatters.json_fmt import write_json
 
 
@@ -66,6 +67,55 @@ def shader_replace_cmd(eid: int, stage: str, shader_id: int, use_json: bool) -> 
     if use_json:
         write_json(result)
         return
+    click.echo(f"replaced\t{result['original_id']}")
+    click.echo("warning: replacement affects all draws using this shader", err=True)
+
+
+@click.command("shader-replace-target")
+@click.argument("target", type=str)
+@click.option(
+    "--stage",
+    required=True,
+    type=click.Choice(["vs", "hs", "ds", "gs", "ps", "cs"]),
+    help="Shader stage",
+)
+@click.option(
+    "--with",
+    "shader_id",
+    required=True,
+    type=int,
+    help="Built shader ID from shader-build",
+)
+@click.option("--json", "use_json", is_flag=True, help="JSON output")
+def shader_replace_target_cmd(target: str, stage: str, shader_id: int, use_json: bool) -> None:
+    """Resolve TARGET from selected-event subtree first, then replace the shader."""
+    eid, source, candidates = resolve_shader_target_eid(target, stage)
+    if eid is None:
+        if use_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "error": {"message": f"unable to resolve target {target!r}"},
+                        "source": source,
+                        "candidates": candidates,
+                    }
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
+        click.echo(f"error: unable to resolve target {target!r} ({source})", err=True)
+        for cand in candidates[:5]:
+            click.echo(
+                f"candidate\t{cand.get('eid', 0)}\t{cand.get('action_name', '')}\t{cand.get('shader_name', '')}\t{cand.get('source', '')}",
+                err=True,
+            )
+        raise SystemExit(1)
+
+    result = call("shader_replace", {"eid": eid, "stage": stage, "shader_id": shader_id})
+    if use_json:
+        write_json({"resolved_eid": eid, "resolved_source": source, **result})
+        return
+    click.echo(f"resolved\t{eid}\t{source}")
     click.echo(f"replaced\t{result['original_id']}")
     click.echo("warning: replacement affects all draws using this shader", err=True)
 

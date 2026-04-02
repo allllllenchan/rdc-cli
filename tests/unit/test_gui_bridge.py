@@ -88,6 +88,21 @@ def test_call_routes_only_shader_methods_to_bridge(
 
     def fake_bridge(method: str, params: dict[str, object], **kwargs: object) -> dict[str, object]:
         bridge_calls.append(method)
+        if method == "selected_subtree_candidates":
+            return {
+                "selected_event": 100,
+                "selected_action_name": "OceanFogPostProcess",
+                "candidates": [
+                    {
+                        "eid": 101,
+                        "depth": 0,
+                        "action_name": "MI_OceanFogPostProcess",
+                        "shader_name": "MI_OceanFogPostProcess",
+                        "is_selected": True,
+                        "shader_id": 7,
+                    }
+                ],
+            }
         if method == "shader_encodings":
             return {"encodings": [{"name": "DXBC"}, {"name": "HLSL"}]}
         return {"ok": True}
@@ -108,10 +123,12 @@ def test_call_routes_only_shader_methods_to_bridge(
 
     encodings = helpers_mod.call("shader_encodings", {})
     draws = helpers_mod.call("draws", {})
+    subtree = helpers_mod.call("selected_subtree_candidates", {"stage": "ps"})
 
     assert encodings["encodings"][0]["name"] == "DXBC"
     assert draws["draws"][0]["eid"] == 1
-    assert bridge_calls == ["shader_encodings"]
+    assert subtree["selected_event"] == 100
+    assert bridge_calls == ["shader_encodings", "selected_subtree_candidates"]
     assert "draws" in daemon_calls
 
 

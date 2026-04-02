@@ -34,9 +34,11 @@ __all__ = [
     "complete_pass_identifier",
     "_sort_numeric_like",
     "_emit_error",
+    "resolve_shader_target_eid",
 ]
 
 _BRIDGE_METHODS = {
+    "selected_subtree_candidates",
     "shader_encodings",
     "shader_build",
     "shader_replace",
@@ -66,6 +68,123 @@ def _emit_error(msg: str) -> NoReturn:
     else:
         click.echo(f"error: {msg}", err=True)
     raise SystemExit(1)
+
+
+def _match_score(text: str, target: str) -> tuple[int, int]:
+    text_lower = text.lower()
+    target_lower = target.lower()
+    if text_lower == target_lower:
+        return (2, len(text_lower))
+    if target_lower in text_lower:
+        return (1, -len(text_lower))
+    return (0, 0)
+
+
+def _rank_target_matches(
+    rows: list[dict[str, Any]], target: str
+) -> list[tuple[tuple[int, int, int, int], dict[str, Any]]]:
+    ranked: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    for row in rows:
+        texts = [
+            str(row.get("action_name") or ""),
+            str(row.get("shader_name") or ""),
+            str(row.get("marker") or ""),
+            str(row.get("pass") or ""),
+        ]
+        best = (0, 0)
+        for text in texts:
+            best = max(best, _match_score(text, target))
+        if best[0] == 0:
+            continue
+        score = (
+            best[0],
+            1 if bool(row.get("is_selected")) else 0,
+            -int(row.get("depth", 9999)),
+            best[1],
+        )
+        ranked.append((score, row))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def _unique_top_match(
+    rows: list[tuple[tuple[int, int, int, int], dict[str, Any]]]
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    top_score = rows[0][0]
+    top_rows = [row for score, row in rows if score == top_score]
+    if len(top_rows) == 1:
+        return top_rows[0]
+    return None
+
+
+def _build_daemon_fallback_candidates(target: str) -> list[dict[str, Any]]:
+    draws = try_call("draws", {}) or {}
+    events = try_call("events", {}) or {}
+    rows: list[dict[str, Any]] = []
+    for row in draws.get("draws", []):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "source": "draws",
+                "eid": row.get("eid", 0),
+                "action_name": row.get("marker") or row.get("name") or "",
+                "marker": row.get("marker") or "",
+                "pass": row.get("pass") or "",
+                "depth": 9999,
+            }
+        )
+    for row in events.get("events", []):
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "source": "events",
+                "eid": row.get("eid", 0),
+                "action_name": row.get("name") or "",
+                "marker": row.get("name") or "",
+                "pass": row.get("type") or "",
+                "depth": 9999,
+            }
+        )
+    return [row for _score, row in _rank_target_matches(rows, target)]
+
+
+def resolve_shader_target_eid(
+    target: str,
+    stage: str,
+    *,
+    max_depth: int = 32,
+) -> tuple[int | None, str, list[dict[str, Any]]]:
+    """Resolve a shader-edit target EID using bridge-first, daemon-fallback search."""
+    bridge_rows: list[dict[str, Any]] = []
+    ranked_bridge: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    bridge_status = try_call("selected_subtree_candidates", {"stage": stage, "max_depth": max_depth})
+    if isinstance(bridge_status, dict):
+        bridge_rows = [
+            {**row, "source": "bridge"}
+            for row in bridge_status.get("candidates", [])
+            if isinstance(row, dict)
+        ]
+        ranked_bridge = _rank_target_matches(bridge_rows, target)
+        unique_bridge = _unique_top_match(ranked_bridge)
+        if unique_bridge is not None:
+            row = unique_bridge
+            return int(row.get("eid", 0)), "bridge:selected-subtree", bridge_rows
+
+    fallback_rows = _build_daemon_fallback_candidates(target)
+    ranked_fallback = _rank_target_matches(fallback_rows, target)
+    unique_fallback = _unique_top_match(ranked_fallback)
+    if unique_fallback is not None:
+        row = unique_fallback
+        return int(row.get("eid", 0)), f"{row.get('source', 'daemon')}:fallback", fallback_rows
+
+    all_rows = [row for _score, row in ranked_bridge] if ranked_bridge else fallback_rows
+    if not all_rows:
+        return None, "no-match", []
+    return None, "ambiguous", all_rows
 
 
 def require_renderdoc() -> Any:

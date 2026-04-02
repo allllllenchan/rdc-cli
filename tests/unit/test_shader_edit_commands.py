@@ -18,6 +18,8 @@ _BUILD_RESPONSE: dict[str, Any] = {"shader_id": 42, "warnings": ""}
 
 _REPLACE_RESPONSE: dict[str, Any] = {"ok": True, "original_id": 500}
 
+_AUTO_REPLACE_RESPONSE: dict[str, Any] = {"ok": True, "original_id": 500}
+
 _RESTORE_RESPONSE: dict[str, Any] = {"ok": True}
 
 _RESTORE_ALL_RESPONSE: dict[str, Any] = {"ok": True, "restored": 1, "freed": 2}
@@ -127,6 +129,29 @@ def test_shader_replace_help() -> None:
     assert "EID" in result.output
 
 
+def test_shader_replace_target_happy(monkeypatch: Any) -> None:
+    _patch(monkeypatch, _AUTO_REPLACE_RESPONSE)
+    monkeypatch.setattr(
+        shader_edit_mod,
+        "resolve_shader_target_eid",
+        lambda target, stage, **kwargs: (120, "bridge:selected-subtree", [{"eid": 120}]),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["shader-replace-target", "MI_OceanFogPostProcess", "--stage", "ps", "--with", "42"],
+    )
+    assert result.exit_code == 0
+    assert "resolved\t120" in result.output
+    assert "replaced" in result.output
+
+
+def test_shader_replace_target_help() -> None:
+    result = CliRunner().invoke(main, ["shader-replace-target", "--help"])
+    assert result.exit_code == 0
+    assert "--stage" in result.output
+    assert "--with" in result.output
+
+
 # ---------------------------------------------------------------------------
 # shader-restore
 # ---------------------------------------------------------------------------
@@ -178,6 +203,7 @@ def test_shader_commands_in_main_help() -> None:
         "shader-encodings",
         "shader-build",
         "shader-replace",
+        "shader-replace-target",
         "shader-restore",
         "shader-restore-all",
     ]

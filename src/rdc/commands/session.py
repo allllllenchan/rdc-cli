@@ -7,7 +7,7 @@ from pathlib import Path
 import click
 from click.shell_completion import CompletionItem
 
-from rdc.bridge_client import default_bridge_dir
+from rdc.bridge_client import default_bridge_dir, send_bridge_request
 from rdc import _platform
 from rdc.commands._helpers import complete_eid
 from rdc.remote_state import RemoteServerState
@@ -21,7 +21,7 @@ from rdc.services.session_service import (
     detach_gui_bridge,
     status_session,
 )
-from rdc.session_state import session_path
+from rdc.session_state import load_session, session_path
 
 
 def _is_android_state(state: RemoteServerState) -> bool:
@@ -271,6 +271,39 @@ def open_cmd(
 
     if bridge_dir is not None and not gui_bridge:
         click.echo("warning: --bridge-dir is ignored without --gui-bridge", err=True)
+
+    if gui_bridge and capture is None and load_session() is None:
+        bridge_root = bridge_dir or default_bridge_dir()
+        try:
+            bridge_status = send_bridge_request("status", {}, bridge_dir=bridge_root, timeout=2.0)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"error: cannot reach shader bridge at {bridge_root}: {exc}", err=True)
+            raise SystemExit(1)
+
+        capture = str(bridge_status.get("filename") or "")
+        if not capture:
+            click.echo("error: gui bridge did not report an active capture", err=True)
+            raise SystemExit(1)
+
+        ok, open_message = open_session(capture)
+        if not ok:
+            click.echo(open_message, err=True)
+            raise SystemExit(1)
+
+        ok, bridge_message = attach_gui_bridge(bridge_dir=bridge_root)
+        if not ok:
+            click.echo(bridge_message, err=True)
+            raise SystemExit(1)
+
+        click.echo(open_message)
+        click.echo(bridge_message)
+        click.echo(f"session: {session_path()}")
+        if preload:
+            from rdc.commands._helpers import call
+
+            result = call("shaders_preload", {})
+            click.echo(f"preloaded {result['shaders']} shader(s)")
+        return
 
     # Dispatch: --connect
     if connect is not None:

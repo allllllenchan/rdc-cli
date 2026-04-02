@@ -51,6 +51,7 @@ from rdc.commands.setup_renderdoc import setup_renderdoc_cmd
 from rdc.commands.shader_edit import (
     shader_build_cmd,
     shader_encodings_cmd,
+    shader_replace_target_cmd,
     shader_replace_cmd,
     shader_restore_all_cmd,
     shader_restore_cmd,
@@ -156,6 +157,7 @@ main.add_command(debug_group, name="debug")
 main.add_command(shader_encodings_cmd, name="shader-encodings")
 main.add_command(shader_build_cmd, name="shader-build")
 main.add_command(shader_replace_cmd, name="shader-replace")
+main.add_command(shader_replace_target_cmd, name="shader-replace-target")
 main.add_command(shader_restore_cmd, name="shader-restore")
 main.add_command(shader_restore_all_cmd, name="shader-restore-all")
 main.add_command(tex_stats_cmd, name="tex-stats")
