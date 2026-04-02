@@ -22,6 +22,10 @@ class SessionState:
     port: int
     token: str
     pid: int
+    backend: str = "daemon"
+    bridge_enabled: bool = False
+    bridge_dir: str = ""
+    bridge_capture: str = ""
 
 
 def _session_dir() -> Path:
@@ -50,6 +54,10 @@ def load_session() -> SessionState | None:
             port=int(data["port"]),
             token=data["token"],
             pid=int(data["pid"]),
+            backend=str(data.get("backend", "daemon")),
+            bridge_enabled=bool(data.get("bridge_enabled", False)),
+            bridge_dir=str(data.get("bridge_dir", "")),
+            bridge_capture=str(data.get("bridge_capture", "")),
         )
     except (json.JSONDecodeError, KeyError, ValueError, TypeError):
         import logging
@@ -72,6 +80,11 @@ def create_session(
     port: int,
     token: str,
     pid: int,
+    *,
+    backend: str = "daemon",
+    bridge_enabled: bool = False,
+    bridge_dir: str = "",
+    bridge_capture: str = "",
 ) -> SessionState:
     state = SessionState(
         capture=capture,
@@ -81,6 +94,10 @@ def create_session(
         port=port,
         token=token,
         pid=pid,
+        backend=backend,
+        bridge_enabled=bridge_enabled,
+        bridge_dir=bridge_dir,
+        bridge_capture=bridge_capture,
     )
     save_session(state)
     return state

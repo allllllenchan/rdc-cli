@@ -46,7 +46,7 @@ from rdc.commands.resources import pass_cmd, passes_cmd, resource_cmd, resources
 from rdc.commands.script import script_cmd
 from rdc.commands.search import search_cmd
 from rdc.commands.serve import serve_cmd
-from rdc.commands.session import close_cmd, goto_cmd, open_cmd, status_cmd
+from rdc.commands.session import bridge_group, close_cmd, goto_cmd, open_cmd, status_cmd
 from rdc.commands.setup_renderdoc import setup_renderdoc_cmd
 from rdc.commands.shader_edit import (
     shader_build_cmd,
@@ -109,6 +109,7 @@ def entry() -> None:
 main.add_command(doctor_cmd, name="doctor")
 main.add_command(capture_cmd, name="capture")
 main.add_command(open_cmd, name="open")
+main.add_command(bridge_group, name="bridge")
 main.add_command(close_cmd, name="close")
 main.add_command(status_cmd, name="status")
 main.add_command(goto_cmd, name="goto")

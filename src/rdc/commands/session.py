@@ -7,15 +7,18 @@ from pathlib import Path
 import click
 from click.shell_completion import CompletionItem
 
+from rdc.bridge_client import default_bridge_dir
 from rdc import _platform
 from rdc.commands._helpers import complete_eid
 from rdc.remote_state import RemoteServerState
 from rdc.services.session_service import (
+    attach_gui_bridge,
     close_session,
     connect_session,
     goto_session,
     listen_open_session,
     open_session,
+    detach_gui_bridge,
     status_session,
 )
 from rdc.session_state import session_path
@@ -175,6 +178,19 @@ def _complete_capture_path(
     help="Connect to an already-running external daemon.",
 )
 @click.option(
+    "--gui-bridge",
+    is_flag=True,
+    default=False,
+    help="Attach the local RenderDoc shader bridge to the active daemon session.",
+)
+@click.option(
+    "--bridge-dir",
+    default=None,
+    metavar="PATH",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Override shader bridge IPC directory (default: temp/renderdoc_shader_bridge).",
+)
+@click.option(
     "--token",
     "connect_token",
     default=None,
@@ -189,6 +205,8 @@ def open_cmd(
     remote_url_deprecated: str | None,
     listen: str | None,
     connect: str | None,
+    gui_bridge: bool,
+    bridge_dir: Path | None,
     connect_token: str | None,
 ) -> None:
     """Create local default session and start daemon skeleton."""
@@ -223,17 +241,36 @@ def open_cmd(
         if listen is not None:
             click.echo("error: --connect is mutually exclusive with --listen", err=True)
             raise SystemExit(1)
+        if gui_bridge:
+            click.echo("error: --connect is mutually exclusive with --gui-bridge", err=True)
+            raise SystemExit(1)
         if connect_token is None:
             click.echo("error: --connect requires --token", err=True)
             raise SystemExit(1)
 
+    if gui_bridge:
+        if capture is not None:
+            click.echo("error: --gui-bridge is mutually exclusive with CAPTURE argument", err=True)
+            raise SystemExit(1)
+        if proxy_url is not None:
+            click.echo("error: --gui-bridge is mutually exclusive with --proxy", err=True)
+            raise SystemExit(1)
+        if listen is not None:
+            click.echo("error: --gui-bridge is mutually exclusive with --listen", err=True)
+            raise SystemExit(1)
+        if connect_token is not None:
+            click.echo("warning: --token is ignored with --gui-bridge", err=True)
+
     # Without --connect, capture is required
-    if connect is None and capture is None:
+    if connect is None and not gui_bridge and capture is None:
         click.echo("error: CAPTURE argument is required (unless using --connect)", err=True)
         raise SystemExit(1)
 
     if connect is None and connect_token is not None:
         click.echo("warning: --token is ignored without --connect", err=True)
+
+    if bridge_dir is not None and not gui_bridge:
+        click.echo("warning: --bridge-dir is ignored without --gui-bridge", err=True)
 
     # Dispatch: --connect
     if connect is not None:
@@ -254,6 +291,15 @@ def open_cmd(
             click.echo(f"error: port out of range: {port} (must be 1-65535)", err=True)
             raise SystemExit(1)
         ok, message = connect_session(host_part, port, connect_token)
+        if not ok:
+            click.echo(message, err=True)
+            raise SystemExit(1)
+        click.echo(message)
+        click.echo(f"session: {session_path()}")
+        return
+
+    if gui_bridge:
+        ok, message = attach_gui_bridge(bridge_dir=bridge_dir or default_bridge_dir())
         if not ok:
             click.echo(message, err=True)
             raise SystemExit(1)
@@ -322,9 +368,78 @@ def status_cmd() -> None:
     click.echo(f"capture: {payload['capture']}")
     click.echo(f"current_eid: {payload['current_eid']}")
     click.echo(f"opened_at: {payload['opened_at']}")
+    click.echo(f"backend: {payload.get('backend', 'daemon')}")
+    if payload.get("bridge_attached"):
+        click.echo(f"bridge_attached: {payload['bridge_attached']}")
+        click.echo(f"bridge_dir: {payload['bridge_dir']}")
+        click.echo(f"bridge_capture: {payload.get('bridge_capture', '')}")
+        click.echo(f"bridge_loaded: {payload['bridge_loaded']}")
+        if payload.get("api"):
+            click.echo(f"api: {payload['api']}")
+        click.echo(f"selected_event: {payload.get('selected_event', 0)}")
+        click.echo(f"current_event: {payload.get('current_event', 0)}")
+        if payload.get("action_name"):
+            click.echo(f"action_name: {payload['action_name']}")
+        click.echo(f"built_shaders: {payload['built_shader_count']}")
+        click.echo(f"replacements: {payload['replacement_count']}")
+        bound_shaders = payload.get("bound_shaders", {})
+        for stage_name in ("vs", "hs", "ds", "gs", "ps", "cs"):
+            shader = bound_shaders.get(stage_name)
+            if not shader:
+                continue
+            shader_name = shader.get("name") or "<unnamed>"
+            click.echo(
+                f"shader_{stage_name}: {shader_name} ({shader.get('resource_id', 0)})"
+            )
     click.echo(f"daemon: {payload['daemon']}")
     if "remote" in payload:
         click.echo(f"remote: {payload['remote']}")
+
+
+@click.group("bridge")
+def bridge_group() -> None:
+    """Manage optional GUI shader bridge attachment for the active session."""
+
+
+@bridge_group.command("attach")
+@click.option(
+    "--bridge-dir",
+    default=None,
+    metavar="PATH",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Override shader bridge IPC directory.",
+)
+def bridge_attach_cmd(bridge_dir: Path | None) -> None:
+    ok, message = attach_gui_bridge(bridge_dir=bridge_dir or default_bridge_dir())
+    if not ok:
+        click.echo(message, err=True)
+        raise SystemExit(1)
+    click.echo(message)
+
+
+@bridge_group.command("detach")
+def bridge_detach_cmd() -> None:
+    ok, message = detach_gui_bridge()
+    if not ok:
+        click.echo(message, err=True)
+        raise SystemExit(1)
+    click.echo(message)
+
+
+@bridge_group.command("status")
+def bridge_status_cmd() -> None:
+    ok, result = status_session()
+    if not ok:
+        click.echo(str(result), err=True)
+        raise SystemExit(1)
+    payload = result
+    assert isinstance(payload, dict)
+    if not payload.get("bridge_attached"):
+        click.echo("bridge: detached")
+        return
+    click.echo(f"bridge: attached")
+    click.echo(f"bridge_dir: {payload['bridge_dir']}")
+    click.echo(f"bridge_capture: {payload.get('bridge_capture', '')}")
 
 
 @click.command("goto")

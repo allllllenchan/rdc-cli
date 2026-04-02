@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import socket
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from rdc import _platform
+from rdc.bridge_client import bridge_available, default_bridge_dir, send_bridge_request
 from rdc.daemon_client import send_request
 from rdc.protocol import goto_request, ping_request, shutdown_request, status_request
 from rdc.session_state import (
@@ -22,6 +24,50 @@ from rdc.session_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+DAEMON_STARTUP_TIMEOUT_S = 45.0
+
+
+def _capture_path_key(value: str) -> str:
+    try:
+        return os.path.normcase(str(Path(value).expanduser().resolve()))
+    except Exception:
+        return os.path.normcase(os.path.abspath(value))
+
+
+def _bridge_active(state: SessionState) -> bool:
+    return bool(getattr(state, "bridge_enabled", False) or getattr(state, "backend", "daemon") == "gui_bridge")
+
+
+def _bridge_session_status(state: SessionState) -> tuple[dict[str, Any] | None, str | None]:
+    if not _bridge_active(state):
+        return None, None
+    bridge_dir = state.bridge_dir or default_bridge_dir()
+    try:
+        bridge_status = send_bridge_request("status", {}, bridge_dir=bridge_dir, timeout=2.0)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"error: gui bridge unreachable: {exc}"
+
+    bridge_filename = str(bridge_status.get("filename") or "")
+    if not bridge_filename:
+        return None, "error: gui bridge did not report an active capture"
+
+    if state.capture and _capture_path_key(state.capture) != _capture_path_key(bridge_filename):
+        return None, "error: gui bridge capture does not match active daemon session"
+
+    bridge_loaded = bool(bridge_status.get("capture_loaded", False))
+    return {
+        "bridge_dir": str(bridge_dir),
+        "bridge_capture": bridge_filename,
+        "bridge_loaded": bridge_loaded,
+        "api": bridge_status.get("api"),
+        "built_shader_count": int(bridge_status.get("built_shader_count", 0)),
+        "replacement_count": int(bridge_status.get("replacement_count", 0)),
+        "current_event": int(bridge_status.get("current_event", 0)),
+        "selected_event": int(bridge_status.get("selected_event", 0)),
+        "action_name": bridge_status.get("action_name"),
+        "bound_shaders": bridge_status.get("bound_shaders", {}),
+    }, None
 
 
 def pick_port() -> int:
@@ -78,7 +124,7 @@ def wait_for_ping(
     host: str,
     port: int,
     token: str,
-    timeout_s: float = 15.0,
+    timeout_s: float = DAEMON_STARTUP_TIMEOUT_S,
     proc: subprocess.Popen[str] | None = None,
 ) -> tuple[bool, str]:
     deadline = time.time() + timeout_s
@@ -167,6 +213,47 @@ def open_session(
     return True, msg
 
 
+def attach_gui_bridge(
+    bridge_dir: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Attach the current daemon session to a local GUI shader bridge."""
+    state, err = _load_live_session()
+    if err:
+        return False, err
+    assert state is not None
+
+    root = Path(bridge_dir) if bridge_dir is not None else default_bridge_dir()
+    try:
+        status = send_bridge_request("status", {}, bridge_dir=root, timeout=2.0)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"error: cannot reach shader bridge at {root}: {exc}"
+
+    capture = str(status.get("filename") or "")
+    if not capture:
+        return False, "error: gui bridge did not report an active capture"
+    if _capture_path_key(state.capture) != _capture_path_key(capture):
+        return False, "error: gui bridge capture does not match the open daemon session"
+
+    state.bridge_enabled = True
+    state.bridge_dir = str(root)
+    state.bridge_capture = capture
+    save_session(state)
+    return True, f"attached: gui bridge ({root})"
+
+
+def detach_gui_bridge() -> tuple[bool, str]:
+    state = load_session()
+    if state is None:
+        return False, "error: no active session"
+    if not _bridge_active(state):
+        return False, "error: no gui bridge attached"
+    state.bridge_enabled = False
+    state.bridge_dir = ""
+    state.bridge_capture = ""
+    save_session(state)
+    return True, "gui bridge detached"
+
+
 def _load_live_session() -> tuple[SessionState | None, str | None]:
     state = load_session()
     if state is None:
@@ -197,6 +284,10 @@ def status_session() -> tuple[bool, dict[str, Any] | str]:
         return False, err
     assert state is not None
 
+    bridge_result, bridge_err = _bridge_session_status(state)
+    if bridge_err:
+        return False, bridge_err
+
     try:
         resp = send_request(state.host, state.port, status_request(state.token, request_id=2))
     except Exception as exc:  # noqa: BLE001
@@ -212,11 +303,15 @@ def status_session() -> tuple[bool, dict[str, Any] | str]:
         "capture": state.capture,
         "current_eid": state.current_eid,
         "opened_at": state.opened_at,
+        "backend": "daemon",
         "daemon": f"{state.host}:{state.port} pid={state.pid}",
+        "bridge_attached": bool(_bridge_active(state)),
     }
     daemon_result = resp.get("result", {})
     if "remote" in daemon_result:
         result["remote"] = daemon_result["remote"]
+    if bridge_result is not None:
+        result.update(bridge_result)
     return True, result
 
 

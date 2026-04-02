@@ -11,6 +11,7 @@ from typing import Any, NoReturn, cast
 import click
 from click.shell_completion import CompletionItem
 
+from rdc.bridge_client import send_bridge_request
 from rdc.capture_core import CaptureResult
 from rdc.daemon_client import send_request, send_request_binary
 from rdc.discover import find_renderdoc
@@ -34,6 +35,14 @@ __all__ = [
     "_sort_numeric_like",
     "_emit_error",
 ]
+
+_BRIDGE_METHODS = {
+    "shader_encodings",
+    "shader_build",
+    "shader_replace",
+    "shader_restore",
+    "shader_restore_all",
+}
 
 
 def _sort_numeric_like(values: set[str] | list[str]) -> list[str]:
@@ -111,6 +120,16 @@ def call(method: str, params: dict[str, Any], *, timeout: float = 30.0) -> dict[
     Raises:
         SystemExit: If the daemon returns an error.
     """
+    session = load_session()
+    if session is None:
+        _emit_error("no active session (run 'rdc open' first)")
+    if method in _BRIDGE_METHODS:
+        if not bool(getattr(session, "bridge_enabled", False) or getattr(session, "backend", "daemon") == "gui_bridge"):
+            _emit_error("gui bridge not attached; run 'rdc bridge attach' first")
+        try:
+            return send_bridge_request(method, params, bridge_dir=session.bridge_dir, timeout=timeout)
+        except ValueError as exc:
+            _emit_error(str(exc))
     host, port, token = require_session()
     payload = _request(method, 1, {"_token": token, **params}).to_dict()
     try:
@@ -128,6 +147,16 @@ def try_call(method: str, params: dict[str, Any]) -> dict[str, Any] | None:
     Unlike call(), this never exits -- failures are silent.
     Use for optional features where partial success is acceptable.
     """
+    session = load_session()
+    if session is None:
+        return None
+    if method in _BRIDGE_METHODS:
+        if not bool(getattr(session, "bridge_enabled", False) or getattr(session, "backend", "daemon") == "gui_bridge"):
+            return None
+        try:
+            return send_bridge_request(method, params, bridge_dir=session.bridge_dir, timeout=1.0)
+        except Exception:
+            return None
     try:
         host, port, token = require_session()
     except SystemExit:
@@ -157,6 +186,9 @@ def call_binary(method: str, params: dict[str, Any]) -> tuple[dict[str, Any], by
     Raises:
         SystemExit: If the daemon returns an error or is unreachable.
     """
+    session = load_session()
+    if session is None:
+        _emit_error("no active session (run 'rdc open' first)")
     host, port, token = require_session()
     payload = _request(method, 1, {"_token": token, **params}).to_dict()
     try:
@@ -218,6 +250,8 @@ def write_capture_to_path(result: CaptureResult, dest: Path) -> CaptureResult:
 def _split_session() -> SessionState | None:
     session = load_session()
     if session is None:
+        return None
+    if getattr(session, "backend", "daemon") != "daemon":
         return None
     pid = getattr(session, "pid", 1)
     if isinstance(pid, int) and pid == 0:

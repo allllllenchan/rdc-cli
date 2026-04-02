@@ -80,9 +80,9 @@ def test_open_session_same_name_alive_fails(
     assert "active session exists" in msg2
 
 
-def test_wait_for_ping_default_timeout_is_15() -> None:
+def test_wait_for_ping_default_timeout_is_45() -> None:
     sig = inspect.signature(session_service.wait_for_ping)
-    assert sig.parameters["timeout_s"].default == 15.0
+    assert sig.parameters["timeout_s"].default == 45.0
 
 
 def test_wait_for_ping_returns_early_on_process_exit() -> None:
